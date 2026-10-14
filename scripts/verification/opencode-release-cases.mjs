@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID, createHash } from "node:crypto";
-import { readFile, writeFile, readdir } from "node:fs/promises";
+import { readFile, writeFile, readdir, rename } from "node:fs/promises";
 import { createServer } from "node:net";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -216,7 +216,17 @@ function fakeChat() {
   return chat;
 }
 
-export async function runCell({ candidate, pin, mode, migration = false }) {
+export async function observeRuntimeReadiness({ facade, baseUrl, workingDirectory, environment, pin, fetch: fetchImpl = fetch, startupTimeoutMs = 1000 }) {
+  const connection = await facade.checkOpenCodeConnection(baseUrl, workingDirectory, { environment, fetch: fetchImpl, startupTimeoutMs });
+  assertPin(connection.version, pin);
+  const response = await fetchImpl(`${baseUrl}${connection.major === 1 ? "/global/health" : "/api/info"}`, { signal: AbortSignal.timeout(startupTimeoutMs) });
+  try { assert.equal(response.status, 401, "Engine must require authentication"); }
+  finally { await response.body?.cancel(); }
+  return connection;
+}
+
+export async function runCell({ candidate, pin, mode, migration = false, caseIds }) {
+  if (caseIds !== undefined) assert.ok(Array.isArray(caseIds) && caseIds.length && new Set(caseIds).size === caseIds.length && caseIds.every((id) => releaseCases.some((row) => row.id === id)), "Invalid targeted case selection");
   const engineBinaries = JSON.parse(process.env.PIPA_MATRIX_ENGINE_BINARIES ?? "{}");
   const runtime = await createRuntimeFixture({ timeoutMs: 7 * 60_000 });
   // This code runs only in the privately spawned cell process, never in the host.
@@ -230,7 +240,7 @@ export async function runCell({ candidate, pin, mode, migration = false }) {
   Object.assign(process.env, runtime.env);
   const load = (file) => import(pathToFileURL(path.join(candidate, "src", `${file}.mjs`)).href);
   const [appModule, facade, state, routines, restart] = await Promise.all(["app", "opencode", "state", "routines", "restart"].map(load));
-  const cell = { cases: [], adapterSelected: "Production facade; no negotiated adapter metadata in current runtime", clientVersion: null, client: "Production native fetch facade", engineReported: null, migrationRequested: migration, evidence: {} };
+  const cell = { cases: [], adapterSelected: null, clientVersion: null, client: "Production native fetch facade", engineReported: null, migrationRequested: migration, ...(caseIds ? { collection: "targeted-diagnostic", caseSelection: caseIds } : {}), evidence: {} };
   const cli = path.join(candidate, "bin", "pipa.mjs");
   const paths = state.pipaPaths(runtime.home);
   runtime.defer(async () => {
@@ -305,11 +315,11 @@ export async function runCell({ candidate, pin, mode, migration = false }) {
     executor = facade.createOpenCodeExecutor({ ...options, environment: runtime.env, fetch: connectedFetch, pollIntervalMs: 50 });
     return executor;
   };
-  const health = async () => {
-    const response = await fetch(`${baseUrl}/session/status?directory=${encodeURIComponent(runtime.workspace)}`, { headers, signal: AbortSignal.timeout(1000) });
-    const value = await response.json();
-    assert.ok(response.ok && value && typeof value === "object" && !Array.isArray(value));
-    return true;
+  const health = async (url = baseUrl) => {
+    const connection = await observeRuntimeReadiness({ facade, baseUrl: url, workingDirectory: runtime.workspace, environment: runtime.env, pin });
+    cell.adapterSelected = `v${connection.major} (authenticated identity; turn compatibility tested separately)`;
+    cell.evidence.connection = { major: connection.major, version: connection.version, workspaceVerified: true };
+    return connection;
   };
   const observeWorker = async (id) => {
     // Read process identity only, never arbitrary host command lines/environment.
@@ -437,21 +447,19 @@ export async function runCell({ candidate, pin, mode, migration = false }) {
             await waitFor(() => fetch(managedUrl, { signal: AbortSignal.timeout(500) }).then(() => false, () => true), { timeoutMs: 4000, label: "Managed port close" });
             if (replacement?.pid) await waitFor(() => !state.isRunning(replacement.pid), { timeoutMs: 4000, label: "replacement exit" });
           }, "Managed CLI/replacement/lock/port");
-          const unauthorized = await fetch(`${baseUrl}/session/status`, { signal: AbortSignal.timeout(1000) });
-          assert.equal(unauthorized.status, 401, "Engine must require authentication");
-          makeExecutor({ baseUrl, artifactRoot: runtime.artifactRoot });
+          const connection = await health();
+          makeExecutor({ baseUrl, connection, artifactRoot: runtime.artifactRoot });
         } else {
           if (mode === "attached") await launchIndependent();
           await startApp();
           assert.equal(app.server.owned, mode === "socket-owned");
           await health();
-          assert.equal((await fetch(`${baseUrl}/session/status`, { signal: AbortSignal.timeout(1000) })).status, 401);
         }
       } catch (error) {
         startupError = error;
         // Diagnostic facade probe still uses the real native engine; it does not
         // bypass readiness for the product app or claim startup was successful.
-        if (!baseUrl || mode === "socket-owned" || mode === "managed") await launchIndependent();
+        if (!baseUrl || (!app && (mode === "socket-owned" || mode === "managed"))) await launchIndependent();
         makeExecutor({ baseUrl, artifactRoot: runtime.artifactRoot });
         throw error;
       }
@@ -979,14 +987,15 @@ export async function runCell({ candidate, pin, mode, migration = false }) {
         return;
       }
       const before = chat.posts.length;
+      const appUrl = app.server.baseUrl;
       await app.shutdown();
       chat.send("slack:CMATRIX:700.001", "intake after stop");
       assert.equal(chat.posts.length, before);
       if (mode === "attached") {
         assert.equal(independent.child.exitCode, null);
-        await health();
+        await health(appUrl);
         cell.evidence.attachedPidSurvived = independent.child.pid;
-      } else await runtime.waitFor(() => fetch(baseUrl, { signal: AbortSignal.timeout(500) }).then(() => false, () => true), { timeoutMs: 5000, label: "owned port close" });
+      } else await runtime.waitFor(() => fetch(appUrl, { signal: AbortSignal.timeout(500) }).then(() => false, () => true), { timeoutMs: 5000, label: "owned port close" });
     },
     "managed-restart": async () => {
       if (mode !== "managed") return { status: "BLOCKED", observed: "Full detached restart belongs to Managed cell or actual Socket live lane" };
@@ -1011,9 +1020,10 @@ export async function runCell({ candidate, pin, mode, migration = false }) {
       await health();
       assert.deepEqual(await state.readInstanceLock(paths.lock), replacement);
       assert.equal(JSON.parse(await runCli("restart", "--status")).state, "completed");
+      cell.evidence.restart = { requestId: outcome.id, old, replacement, workerPids: [...workerPids], workersExited: true, durableState: outcome.state, lifecycleStatus: "PASS", followupStatus: "FAIL" };
       const result = await turn("after-restart");
       assertTurnOutcome(result, { sessionId: result.sessionId, text: textFor("after-restart") });
-      cell.evidence.restart = { requestId: outcome.id, old, replacement, workerPids: [...workerPids], workersExited: true, durableState: outcome.state };
+      cell.evidence.restart.followupStatus = "PASS";
     },
   };
   async function schedulerBarrier(label) {
@@ -1068,7 +1078,7 @@ export async function runCell({ candidate, pin, mode, migration = false }) {
       await state.writePrivateJson(faultPaths.config, saved);
       await writeFile(fault.env.OPENCODE_CONFIG, JSON.stringify(providerConfig(provider.url)));
       original = fault.spawn(process.execPath, [cli, "start"]);
-      await fault.waitFor(() => fetch(`${url}/session/status?directory=${encodeURIComponent(fault.workspace)}`, { headers, signal: AbortSignal.timeout(1000) }).then((response) => response.ok, () => false), { timeoutMs: 10000 });
+      await fault.waitFor(() => observeRuntimeReadiness({ facade, baseUrl: url, workingDirectory: fault.workspace, environment: fault.env, pin }).catch(() => false), { timeoutMs: 10000, label: "fault original native workspace readiness" });
       const old = await state.readInstanceLock(faultPaths.lock);
       fault.defer(async () => {
         const lock = await state.readInstanceLock(faultPaths.lock);
@@ -1079,9 +1089,23 @@ export async function runCell({ candidate, pin, mode, migration = false }) {
         blocker = createServer();
         await fault.listen(blocker);
         await state.writePrivateJson(faultPaths.config, { ...saved, openCodePort: blocker.address().port });
+      } else if (pin.startsWith("2.")) {
+        // 2.0.29 ignores malformed JSON documents. Break its actual native config
+        // directory instead; do not call a tolerated document a readiness fault.
+        const configUrl = new URL(`${url}/api/config`);
+        configUrl.searchParams.set("location[directory]", fault.workspace);
+        const response = await fetch(configUrl, { headers, signal: AbortSignal.timeout(1000) });
+        assert.equal(response.status, 200);
+        const entries = await response.json();
+        assert.ok(Array.isArray(entries), "Native config must list its sources");
+        const directory = entries.find((entry) => entry.type === "directory")?.path;
+        assert.equal(typeof directory, "string", "Native config directory not discovered");
+        const relative = path.relative(fault.root, directory);
+        assert.ok(relative && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative), "Config fault must stay inside its private fixture");
+        await rename(directory, `${directory}.unready`);
+        await writeFile(directory, "Not a configuration directory.");
       } else {
-        // The real server binds, but real workspace/config initialization errors.
-        // No fake engine or substituted readiness response is involved.
+        // Native v1 rejects this document during workspace initialization.
         await writeFile(fault.env.OPENCODE_CONFIG, "{ invalid configuration");
       }
       const requests = await Promise.all([restart.requestRestart({ home: fault.home }), restart.requestRestart({ home: fault.home })]);
@@ -1135,7 +1159,8 @@ export async function runCell({ candidate, pin, mode, migration = false }) {
     await routines.deleteRoutine(id, paths);
   }
   try {
-    for (const definition of [...releaseCases.filter((row) => row.id !== "stop-ownership"), ...releaseCases.filter((row) => row.id === "stop-ownership")]) {
+    const selectedCases = caseIds ? releaseCases.filter((row) => caseIds.includes(row.id)) : releaseCases;
+    for (const definition of [...selectedCases.filter((row) => row.id !== "stop-ownership"), ...selectedCases.filter((row) => row.id === "stop-ownership")]) {
       await recordCase(cell.cases, definition, async () => {
         if (definition.id === "models-switch" && !pin.startsWith("2.")) return { status: "NOT_APPLICABLE", observed: "Native v1 has no live v2 HTTP switch operation; ordinary model execution is covered separately" };
         if (definition.blocked) return { status: "BLOCKED", observed: definition.blocked };

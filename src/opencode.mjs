@@ -1,4 +1,5 @@
 import crossSpawn from "cross-spawn";
+import { randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, open, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -22,6 +23,16 @@ export class PipaStoppedError extends Error {
 
 export class PipaRestartingError extends PipaStoppedError {}
 
+export class OpenCodeReadinessError extends Error {}
+
+export function parseOpenCodeVersion(output) {
+  const match = /^(?:OpenCode\s+)?v?((0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)$/iu.exec(String(output ?? "").trim());
+  if (!match || match[3]?.split(".").some((part) => /^0\d+$/u.test(part))) throw new Error("OpenCode identity has an invalid version. Check `opencode --version` and the selected server URL.");
+  const major = Number(match[2]);
+  if (major !== 1 && major !== 2) throw new Error("Unsupported OpenCode major. Install a supported v1 or v2 runtime and check `opencode --version`.");
+  return { version: match[1], major };
+}
+
 export function cleanChildEnvironment(environment = process.env) {
   return {
     ...Object.fromEntries(Object.entries(environment).filter(([key]) => !SLACK_SECRET_ENV_KEY.test(key))),
@@ -32,47 +43,51 @@ export function cleanChildEnvironment(environment = process.env) {
 export async function startSocketOpenCodeServer(config, options = {}) {
   const environment = options.environment ?? process.env;
   const attachUrl = options.attachUrl ?? environment.PIPA_OPENCODE_ATTACH_URL?.trim();
-  const fetchImpl = options.fetch ?? fetch;
   const startupTimeoutMs = options.startupTimeoutMs ?? 30_000;
-  const headers = authenticationHeaders(environment);
-
   if (attachUrl) {
     const baseUrl = normalizeBaseUrl(attachUrl);
-    await waitForWorkspace(baseUrl, config.workingDirectory, fetchImpl, headers, startupTimeoutMs, options.signal);
-    return externalServer(baseUrl);
+    const connection = await checkOpenCodeConnection(baseUrl, config.workingDirectory, { ...options, environment });
+    return { ...externalServer(baseUrl), connection };
   }
 
+  const identity = parseOpenCodeVersion(await (options.checkOpenCode ?? runOpenCodeVersion)(options));
+  options.signal?.throwIfAborted();
+  const childEnvironment = ownedEnvironment(environment, identity.major);
   const spawn = options.spawn ?? crossSpawn;
   const platform = options.platform ?? process.platform;
   const child = spawn("opencode", [
     "serve",
     "--hostname", "127.0.0.1",
     "--port", "0",
-    "--log-level", "ERROR",
+    "--log-level", identity.major === 1 ? "ERROR" : "error",
   ], {
     cwd: config.workingDirectory,
-    env: cleanChildEnvironment(environment),
+    env: childEnvironment,
     shell: false,
     stdio: ["ignore", "pipe", "pipe"],
   });
   const exit = waitForExit(child);
 
+  const controller = new AbortController();
+  const startupSignal = AbortSignal.any([controller.signal, ...(options.signal ? [options.signal] : [])]);
   try {
     const baseUrl = await Promise.race([
-      readListeningUrl(child, startupTimeoutMs),
+      readListeningUrl(child, startupTimeoutMs, startupSignal),
       exit.then((code) => { throw new Error(`OpenCode server exited before startup with code ${code}.`); }),
     ]);
     child.stdout?.resume();
     child.stderr?.resume();
-    await Promise.race([
-      waitForWorkspace(baseUrl, config.workingDirectory, fetchImpl, headers, startupTimeoutMs, options.signal),
+    const connection = await Promise.race([
+      checkOpenCodeConnection(baseUrl, config.workingDirectory, { ...options, environment: childEnvironment, identity, signal: startupSignal }),
       exit.then((code) => { throw new Error(`OpenCode server exited before startup with code ${code}.`); }),
     ]);
-    return ownedServer(baseUrl, child, exit, platform);
+    return { ...ownedServer(baseUrl, child, exit, platform), connection };
   } catch (error) {
     terminateChild(child, platform);
     await Promise.race([exit.catch(() => undefined), delay(5_000)]);
     throw error;
+  } finally {
+    controller.abort();
   }
 }
 
@@ -80,7 +95,7 @@ export function createOpenCodeExecutor(options = {}) {
   const baseUrl = normalizeBaseUrl(options.baseUrl);
   const fetchImpl = options.fetch ?? fetch;
   const environment = options.environment ?? process.env;
-  const headers = authenticationHeaders(environment);
+  const headers = options.connection?.headers ?? authenticationHeaders(environment);
   const pollIntervalMs = options.pollIntervalMs ?? 1_000;
   const useDataUrls = !isLoopbackUrl(baseUrl);
   const remove = options.rm ?? rm;
@@ -284,19 +299,22 @@ async function sessionArtifactDirectory(root, sessionId, workingDirectory) {
   return path.join(resolvedRoot, sessionId);
 }
 
-export function startOpenCodeServer(config, options = {}) {
+export async function startOpenCodeServer(config, options = {}) {
+  const identity = parseOpenCodeVersion(await (options.checkOpenCode ?? runOpenCodeVersion)(options));
+  options.signal?.throwIfAborted();
+  const environment = ownedEnvironment(options.environment ?? process.env, identity.major);
   const spawn = options.spawn ?? crossSpawn;
   const platform = options.platform ?? process.platform;
   const child = spawn("opencode", [
     "serve",
     "--hostname", config.openCodeHostname,
     "--port", String(config.openCodePort),
-    "--log-level", "ERROR",
+    "--log-level", identity.major === 1 ? "ERROR" : "error",
   ], {
     cwd: config.workingDirectory,
-    env: cleanChildEnvironment(options.environment ?? process.env),
+    env: environment,
     shell: false,
-    stdio: "inherit",
+    stdio: config.openCodePort === 0 ? ["ignore", "pipe", "pipe"] : "inherit",
   });
   let stopping = false;
   const exit = waitForExit(child).then((code) => {
@@ -304,14 +322,19 @@ export function startOpenCodeServer(config, options = {}) {
   });
   void exit.catch(() => undefined);
 
-  return {
+  const listening = config.openCodePort === 0 ? readListeningUrl(child, options.startupTimeoutMs ?? 30_000, options.signal) : null;
+  void listening?.catch(() => undefined);
+  const server = {
     async ready() {
       const controller = new AbortController();
       const hostname = config.openCodeHostname.includes(":") && !config.openCodeHostname.startsWith("[") ? `[${config.openCodeHostname}]` : config.openCodeHostname;
       try {
-        await Promise.race([
-          waitForWorkspace(`http://${hostname}:${config.openCodePort}`, config.workingDirectory,
-            options.fetch ?? fetch, authenticationHeaders(options.environment ?? process.env), options.startupTimeoutMs ?? 30_000, controller.signal),
+        const baseUrl = listening ? await Promise.race([listening, exit.then(() => { throw new Error("OpenCode stopped before reporting its listening URL."); })]) : `http://${hostname}:${config.openCodePort}`;
+        child.stdout?.resume();
+        child.stderr?.resume();
+        server.connection = await Promise.race([
+          checkOpenCodeConnection(baseUrl, config.workingDirectory, { ...options, environment, identity,
+            signal: AbortSignal.any([controller.signal, ...(options.signal ? [options.signal] : [])]) }),
           exit.then(() => { throw new Error("OpenCode stopped before workspace readiness."); }),
         ]);
       } finally { controller.abort(); }
@@ -323,9 +346,11 @@ export function startOpenCodeServer(config, options = {}) {
       terminateChild(child, platform, signal);
     },
   };
+  return server;
 }
 
 export async function runOpenCodeVersion(options = {}) {
+  options.signal?.throwIfAborted();
   const spawn = options.spawn ?? crossSpawn;
   const platform = options.platform ?? process.platform;
   const timeoutMs = options.timeoutMs ?? 30_000;
@@ -335,6 +360,8 @@ export async function runOpenCodeVersion(options = {}) {
     stdio: ["ignore", "pipe", "pipe"],
   });
   let timer;
+  const abort = () => terminateChild(child, platform);
+  options.signal?.addEventListener("abort", abort, { once: true });
   try {
     const operation = Promise.all([collect(child.stdout), collect(child.stderr), waitForExit(child)]);
     const timeout = new Promise((_, reject) => {
@@ -343,7 +370,7 @@ export async function runOpenCodeVersion(options = {}) {
         reject(new Error(`OpenCode version check timed out after ${timeoutMs}ms.`));
       }, timeoutMs);
     });
-    const [stdout, stderr, code] = await Promise.race([operation, timeout]);
+    const [stdout, stderr, code] = await (options.signal ? abortable(Promise.race([operation, timeout]), options.signal) : Promise.race([operation, timeout]));
     if (code !== 0) throw new Error(stderr.trim() || "OpenCode version check failed.");
     return stdout.trim();
   } catch (error) {
@@ -351,6 +378,7 @@ export async function runOpenCodeVersion(options = {}) {
     throw error;
   } finally {
     clearTimeout(timer);
+    options.signal?.removeEventListener("abort", abort);
   }
 }
 
@@ -546,31 +574,98 @@ function externalServer(baseUrl) {
   };
 }
 
-async function waitForWorkspace(baseUrl, workingDirectory, fetchImpl, headers, timeoutMs, signal) {
-  const deadline = Date.now() + timeoutMs;
+export async function checkOpenCodeConnection(baseUrl, workingDirectory, options = {}) {
+  baseUrl = normalizeBaseUrl(baseUrl);
+  const fetchImpl = options.fetch ?? fetch;
+  const environment = options.environment ?? process.env;
+  const signal = options.signal;
+  const deadline = Date.now() + (options.startupTimeoutMs ?? 30_000);
+  let connection;
+  let stage = "workspace readiness";
+  async function read(pathname, headers, directory, candidate = false) {
+    const url = serverUrl(baseUrl, pathname, directory);
+    const response = await fetchImpl(url, {
+      headers,
+      redirect: "manual",
+      signal: AbortSignal.any([AbortSignal.timeout(Math.min(5_000, Math.max(1, deadline - Date.now()))), ...(signal ? [signal] : [])]),
+    });
+    if (!response.ok) await response.body?.cancel().catch(() => undefined);
+    if (response.status === 401 || response.status === 403) throw new Error("OpenCode authentication failed. Check OPENCODE_SERVER_USERNAME/OPENCODE_SERVER_PASSWORD for v1 or OPENCODE_PASSWORD (then OPENCODE_SERVER_PASSWORD) for v2 credentials.");
+    if ([502, 503, 504].includes(response.status)) throw new OpenCodeReadinessError("OpenCode is temporarily unavailable.");
+    if (candidate && [404, 405].includes(response.status)) return null;
+    if (!response.ok) throw new Error(`OpenCode protocol check failed (HTTP ${response.status}). Check the server URL and supported runtime.`);
+    try { return await response.json(); }
+    catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+      if (candidate) return null; // Legacy identity routes on v2 serve the web UI.
+      throw new Error("OpenCode protocol check returned invalid JSON. Check the server URL and runtime.");
+    }
+  }
   while (Date.now() < deadline) {
+    signal?.throwIfAborted();
     try {
-      const status = await fetchImpl(serverUrl(baseUrl, "/session/status", workingDirectory), {
-        headers,
-        signal: AbortSignal.any([AbortSignal.timeout(Math.min(5_000, Math.max(1, deadline - Date.now()))), ...(signal ? [signal] : [])]),
-      });
-      const sessions = status.ok ? await status.json() : null;
-      if (sessions && typeof sessions === "object" && !Array.isArray(sessions)
-        && Object.values(sessions).every((session) => session && typeof session === "object" && typeof session.type === "string")) return;
-    } catch {
-      // OpenCode can accept its socket before the configured workspace is ready.
+      if (!connection) {
+        const v1Headers = authenticationHeaders(environment, 1);
+        const health = await read("/global/health", v1Headers, undefined, true);
+        if (typeof health?.healthy === "boolean" && typeof health.version === "string") {
+          const identity = parseOpenCodeVersion(health.version);
+          if (identity.major !== 1) throw new Error("OpenCode identity/protocol mismatch at /global/health.");
+          if (!health.healthy) throw new OpenCodeReadinessError("OpenCode is not healthy yet.");
+          connection = { ...identity, headers: v1Headers };
+        } else {
+          const headers = authenticationHeaders(environment, 2);
+          const info = await read("/api/info", headers, undefined, true);
+          if (!info || typeof info.version !== "string" || !Number.isSafeInteger(info.pid) || info.pid <= 0
+            || !Array.isArray(info.urls) || !info.urls.every((url) => typeof url === "string") || typeof info.paths?.tmp !== "string") {
+            throw new Error("OpenCode identity protocol is unsupported. Check the selected server URL and install a supported v1 or v2 runtime.");
+          }
+          const identity = parseOpenCodeVersion(info.version);
+          if (identity.major !== 2) throw new Error("OpenCode identity/protocol mismatch at /api/info.");
+          connection = { ...identity, headers };
+        }
+        if (options.identity && options.identity.version !== connection.version) throw new Error("OpenCode CLI/server identity mismatch. Check the executable and selected listening server.");
+      }
+      const headers = connection.headers;
+      if (connection.major === 2) {
+        stage = "migration";
+        const migration = await read("/api/experimental/migration/v1", headers);
+        if (migration?.status === "error" && typeof migration.error === "string") throw new Error("OpenCode migration failed. Resolve the migration with OpenCode before starting Pipa; Pipa state has been retained.");
+        if (migration?.status === "required" || (migration?.status === "running" && typeof migration.progress?.label === "string")) {
+          throw new OpenCodeReadinessError("OpenCode migration is not complete.");
+        }
+        if (migration?.status !== "completed") throw new Error("OpenCode migration protocol has an invalid status. Check the supported runtime.");
+        stage = "workspace readiness";
+        const locationUrl = `/api/location?${new URLSearchParams({ "location[directory]": workingDirectory })}`;
+        const location = await read(locationUrl, headers);
+        if (typeof location?.directory !== "string" || !path.isAbsolute(location.directory) || typeof location.project?.id !== "string"
+          || typeof location.project?.directory !== "string" || typeof location.project?.canonical !== "string") throw new Error("OpenCode location protocol has an invalid schema.");
+        if (path.resolve(location.directory) !== path.resolve(workingDirectory)) throw new Error("OpenCode workspace identity mismatch. Select a server serving the configured working directory.");
+      } else {
+        const location = await read("/path", headers, workingDirectory);
+        if (typeof location?.directory !== "string" || !path.isAbsolute(location.directory)) throw new Error("OpenCode workspace protocol has an invalid schema.");
+        if (path.resolve(location.directory) !== path.resolve(workingDirectory)) throw new Error("OpenCode workspace identity mismatch. Select a server serving the configured working directory.");
+        const sessions = await read("/session/status", headers, workingDirectory);
+        if (!sessions || typeof sessions !== "object" || Array.isArray(sessions)
+          || !Object.values(sessions).every((session) => session && typeof session === "object" && typeof session.type === "string")) throw new Error("OpenCode workspace protocol has an invalid status schema.");
+      }
+      return { ...connection, baseUrl, workingDirectory };
+    } catch (error) {
+      if (signal?.aborted) throw signal.reason;
+      if (!(error instanceof OpenCodeReadinessError) && !isNetworkError(error) && error.name !== "TimeoutError") throw error;
     }
     await delay(Math.min(250, Math.max(0, deadline - Date.now())), signal);
   }
-  throw new Error("OpenCode workspace readiness check timed out.");
+  throw new OpenCodeReadinessError(`OpenCode ${stage} check timed out. ${stage === "migration" ? "Complete the migration with OpenCode before starting Pipa; Pipa state has been retained." : "Check the server and configured working directory."}`);
 }
 
-function readListeningUrl(child, timeoutMs) {
+function readListeningUrl(child, timeoutMs, signal) {
   return new Promise((resolve, reject) => {
     let output = "";
     const cleanup = () => {
       child.stdout?.off("data", inspect);
       child.stderr?.off("data", inspect);
+      child.off("close", closed);
+      signal?.removeEventListener("abort", abort);
     };
     const finish = (callback, value) => {
       clearTimeout(timer);
@@ -584,17 +679,33 @@ function readListeningUrl(child, timeoutMs) {
       finish(resolve, normalizeBaseUrl(match[0]));
     };
     const timer = setTimeout(() => finish(reject, new Error("OpenCode server did not report its listening URL.")), timeoutMs);
+    const closed = () => finish(reject, new Error("OpenCode stopped before reporting its listening URL."));
+    const abort = () => finish(reject, signal.reason);
     timer.unref?.();
     child.stdout?.on("data", inspect);
     child.stderr?.on("data", inspect);
+    child.once("close", closed);
+    if (signal?.aborted) abort();
+    else signal?.addEventListener("abort", abort, { once: true });
   });
 }
 
-function authenticationHeaders(environment) {
-  const password = environment.OPENCODE_SERVER_PASSWORD;
+function authenticationHeaders(environment, major = 1) {
+  const password = major === 2 ? environment.OPENCODE_PASSWORD || environment.OPENCODE_SERVER_PASSWORD : environment.OPENCODE_SERVER_PASSWORD;
   if (!password) return {};
-  const username = environment.OPENCODE_SERVER_USERNAME?.trim() || "opencode";
+  const username = major === 2 ? "opencode" : environment.OPENCODE_SERVER_USERNAME?.trim() || "opencode";
   return { authorization: `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}` };
+}
+
+function ownedEnvironment(environment, major) {
+  const clean = cleanChildEnvironment(environment);
+  const password = (major === 2 ? clean.OPENCODE_PASSWORD || clean.OPENCODE_SERVER_PASSWORD : clean.OPENCODE_SERVER_PASSWORD) || randomBytes(32).toString("hex");
+  clean.OPENCODE_SERVER_PASSWORD = password;
+  if (major === 2) {
+    clean.OPENCODE_PASSWORD = password;
+    clean.OPENCODE_SERVER_USERNAME = "opencode";
+  }
+  return clean;
 }
 
 function normalizeBaseUrl(value) {

@@ -265,21 +265,19 @@ for (const sessionId of [null, "ses_contract"]) test(`v2 baseline FAIL observati
   t.diagnostic(`Compatibility FAIL (expected pre-port observation): ${caseName}; no v2 adapter selected. This passing characterization is not a compatibility pass.`);
 });
 
-test("R1 baseline: attached v1 readiness passes; v2 HTML fails; authenticated identity selection is BLOCKED", async (t) => {
+test("R1 U1: attached identity and workspace readiness select both generations", async (t) => {
   for (const generation of ["v1", "v2"]) {
     const { runtime, wire } = await fixture(t, generation);
     const starting = startSocketOpenCodeServer({ workingDirectory: runtime.workspace }, { environment: { ...runtime.env, PIPA_OPENCODE_ATTACH_URL: "http://127.0.0.1:4096" }, fetch: wire.fetch, startupTimeoutMs: 10 });
-    if (generation === "v2") await assert.rejects(starting, /workspace readiness check timed out/u);
-    else {
-      const server = await starting;
-      assert.equal(server.owned, false);
-      server.stop();
-      await server.wait();
-    }
-    assert.equal(wire.calls.some((call) => ["/api/info", "/global/health"].includes(call.path)), false);
+    const server = await starting;
+    assert.equal(server.owned, false);
+    assert.equal(server.connection.major, generation === "v1" ? 1 : 2);
+    assert.equal(server.connection.version, generation === "v1" ? "1.19.0" : "2.0.29");
+    server.stop();
+    await server.wait();
+    assert.equal(wire.calls.some((call) => call.path === "/api/info"), generation === "v2");
     wire.assertComplete();
   }
-  t.diagnostic("Selection proof BLOCKED until U1: production readiness probes only /session/status; no forced adapter is used.");
 });
 
 test("isolated concurrent roots: abort closes process trees, listeners, locks and staging", async (t) => {

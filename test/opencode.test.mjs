@@ -8,6 +8,8 @@ import test from "node:test";
 import {
   cleanChildEnvironment,
   createOpenCodeExecutor,
+  OpenCodeReadinessError,
+  parseOpenCodeVersion,
   MAX_ATTACHMENT_BYTES,
   PipaStoppedError,
   runOpenCodeVersion,
@@ -26,6 +28,205 @@ test("removes Slack credentials from child environments regardless of casing", (
   assert.equal(cleanChildEnvironment({ PIPA_HOME: "relative-profile" }).PIPA_HOME, path.resolve("relative-profile"));
 });
 
+const v2Info = { version: "2.0.29", pid: 4242, urls: ["http://localhost:5555"], paths: { tmp: "/tmp" } };
+const v2Location = { directory: "/work", project: { id: "prj_test", directory: "/work", canonical: "/work" } };
+
+test("U1 CLI version parsing rejects malformed semver and accepts newer patches", () => {
+  for (const output of ["", "2", "2.0", "02.0.29", "2.00.29", "2.0.29-01", "2.0.29-..", "2.0.29garbage", "<html>"]) assert.throws(() => parseOpenCodeVersion(output), /invalid version/u);
+  assert.deepEqual(parseOpenCodeVersion("OpenCode v2.0.99"), { major: 2, version: "2.0.99" });
+  assert.deepEqual(parseOpenCodeVersion("1.19.1+build.1"), { major: 1, version: "1.19.1+build.1" });
+});
+
+test("U1 attached identity uses server, including v1 experimental api and v2 password precedence", async () => {
+  for (const [major, nativePassword] of [[1, "native"], [2, "native"], [2, undefined]]) {
+    const calls = [];
+    const server = await startSocketOpenCodeServer({ workingDirectory: "/work" }, {
+      attachUrl: "http://localhost:5555", environment: { OPENCODE_SERVER_USERNAME: "custom", OPENCODE_SERVER_PASSWORD: "legacy", OPENCODE_PASSWORD: nativePassword },
+      spawn: () => assert.fail("attached must not inspect installed executable"),
+      fetch: async (url, init) => {
+        const pathname = new URL(url).pathname;
+        calls.push(pathname);
+        if (pathname === "/global/health") {
+          assert.equal(init.headers.authorization, `Basic ${Buffer.from("custom:legacy").toString("base64")}`);
+          return major === 1 ? jsonResponse({ healthy: true, version: "1.19.0" }) : new Response("<!doctype html>");
+        }
+        if (pathname === "/api/info") {
+          assert.equal(init.headers.authorization, `Basic ${Buffer.from(nativePassword ? "opencode:native" : "opencode:legacy").toString("base64")}`);
+          return jsonResponse(v2Info);
+        }
+        if (pathname === "/api/experimental/migration/v1") return jsonResponse({ status: "completed" });
+        if (pathname === "/api/location") {
+          assert.equal(new URL(url).searchParams.get("location[directory]"), "/work");
+          return jsonResponse(v2Location);
+        }
+        if (pathname === "/session/status") return jsonResponse({});
+        if (pathname === "/path") return jsonResponse({ directory: "/work" });
+        assert.fail(pathname);
+      },
+    });
+    assert.equal(server.connection.major, major);
+    assert.equal(server.connection.version, major === 1 ? "1.19.0" : "2.0.29");
+    assert.equal(calls.includes("/api/info"), major === 2);
+    assert.equal(server.owned, false);
+    server.stop(); await server.wait();
+  }
+});
+
+for (const status of [401, 403]) test(`U1 auth ${status} never downgrades`, async () => {
+  const calls = [];
+  let cancelled = false;
+  await assert.rejects(startSocketOpenCodeServer({ workingDirectory: "/work" }, {
+    attachUrl: "http://localhost:5555", environment: {}, startupTimeoutMs: 20,
+    fetch: async (url) => {
+      calls.push(new URL(url).pathname);
+      return new Response(new ReadableStream({ cancel() { cancelled = true; } }), { status });
+    },
+  }), /authentication.*OPENCODE|credentials/iu);
+  assert.deepEqual(calls, ["/global/health"]);
+  assert.equal(cancelled, true);
+});
+
+for (const state of ["required", "running", "error"]) test(`U1 v2 migration ${state} gates location readiness`, async () => {
+  let locations = 0;
+  await assert.rejects(startSocketOpenCodeServer({ workingDirectory: "/work" }, {
+    attachUrl: "http://localhost:5555", environment: {}, startupTimeoutMs: 20,
+    fetch: async (url) => {
+      const pathname = new URL(url).pathname;
+      if (pathname === "/global/health") return new Response("<html>");
+      if (pathname === "/api/info") return jsonResponse(v2Info);
+      if (pathname === "/api/experimental/migration/v1") return jsonResponse({ status: state, ...(state === "running" ? { progress: { label: "history" } } : {}), ...(state === "error" ? { error: "private details" } : {}) });
+      locations++; return jsonResponse(v2Location);
+    },
+  }), state === "error" ? /migration failed/iu : /migration.*timed out/iu);
+  assert.equal(locations, 0);
+});
+
+test("U1 owned version preflight chooses v2 launch settings, private auth and catches mismatch", async () => {
+  for (const mismatch of [false, true]) {
+    const child = childProcess();
+    let invocation;
+    let killed = false;
+    child.kill = () => { killed = true; queueMicrotask(() => child.emit("close", 0)); return true; };
+    const starting = startSocketOpenCodeServer({ workingDirectory: "/work" }, {
+      environment: { PIPA_SLACK_BOT_TOKEN: "secret" }, checkOpenCode: async () => "OpenCode 2.0.29",
+      spawn: (command, args, options) => { invocation = { args, options }; queueMicrotask(() => child.stdout.write("http://127.0.0.1:5555\n")); return child; },
+      fetch: async (url, init) => {
+        assert.equal(init.headers.authorization, `Basic ${Buffer.from(`opencode:${invocation.options.env.OPENCODE_PASSWORD}`).toString("base64")}`);
+        const pathname = new URL(url).pathname;
+        if (pathname === "/global/health") return mismatch ? jsonResponse({ healthy: true, version: "1.19.0" }) : new Response("<html>");
+        if (pathname === "/api/info") return jsonResponse(v2Info);
+        if (pathname === "/api/experimental/migration/v1") return jsonResponse({ status: "completed" });
+        return jsonResponse(v2Location);
+      },
+    });
+    if (mismatch) { await assert.rejects(starting, /identity.*mismatch/iu); assert.equal(killed, true); }
+    else {
+      const server = await starting;
+      assert.ok(invocation.options.env.OPENCODE_PASSWORD.length >= 32);
+      assert.equal(invocation.options.env.PIPA_SLACK_BOT_TOKEN, undefined);
+      assert.deepEqual(invocation.args, ["serve", "--hostname", "127.0.0.1", "--port", "0", "--log-level", "error"]);
+      assert.equal(server.connection.major, 2);
+      server.stop(); await server.wait();
+    }
+  }
+});
+
+for (const invalid of ["html", "schema", "major"]) test(`U1 invalid identity ${invalid} is actionable`, async () => {
+  await assert.rejects(startSocketOpenCodeServer({ workingDirectory: "/work" }, {
+    attachUrl: "http://localhost:5555", environment: {}, startupTimeoutMs: 20,
+    fetch: async () => invalid === "html" ? new Response("<html>") : jsonResponse(invalid === "major" ? { healthy: true, version: "3.0.0" } : { version: "2.0.29" }),
+  }), /unsupported|protocol|identity/iu);
+});
+
+test("U1 v2 credential failure stops before migration without a legacy downgrade", async () => {
+  for (const environment of [{}, { OPENCODE_SERVER_PASSWORD: "wrong", OPENCODE_SERVER_USERNAME: "custom" }, { OPENCODE_PASSWORD: "wrong", OPENCODE_SERVER_PASSWORD: "correct", OPENCODE_SERVER_USERNAME: "custom" }]) {
+    const calls = [];
+    await assert.rejects(startSocketOpenCodeServer({ workingDirectory: "/work" }, {
+      attachUrl: "http://localhost:5555", environment,
+      fetch: async (url, init) => {
+        const pathname = new URL(url).pathname;
+        calls.push(pathname);
+        if (pathname === "/global/health") return new Response("<html>");
+        assert.equal(init.headers.authorization, environment.OPENCODE_SERVER_PASSWORD ? `Basic ${Buffer.from("opencode:wrong").toString("base64")}` : undefined);
+        return jsonResponse({}, 401);
+      },
+    }), /authentication/iu);
+    assert.deepEqual(calls, ["/global/health", "/api/info"]);
+  }
+});
+
+test("U1 migration completes before location; identity is negotiated once", async () => {
+  const calls = [];
+  let migrationReads = 0;
+  const server = await startSocketOpenCodeServer({ workingDirectory: "/work" }, {
+    attachUrl: "http://localhost:5555", environment: {}, startupTimeoutMs: 1000,
+    fetch: async (url) => {
+      const pathname = new URL(url).pathname;
+      calls.push(pathname);
+      if (pathname === "/global/health") return new Response("<html>");
+      if (pathname === "/api/info") return jsonResponse(v2Info);
+      if (pathname === "/api/experimental/migration/v1") return jsonResponse(++migrationReads === 1 ? { status: "running", progress: { label: "history" } } : { status: "completed" });
+      return jsonResponse(v2Location);
+    },
+  });
+  assert.deepEqual(calls, ["/global/health", "/api/info", "/api/experimental/migration/v1", "/api/experimental/migration/v1", "/api/location"]);
+  server.stop(); await server.wait();
+});
+
+test("U1 owned preflight missing executable and unsupported version never launch serve", async () => {
+  const missing = childProcess();
+  let calls = 0;
+  await assert.rejects(startSocketOpenCodeServer({ workingDirectory: "/work" }, {
+    environment: {}, spawn: (_command, args) => {
+      calls++;
+      assert.deepEqual(args, ["--version"]);
+      queueMicrotask(() => missing.emit("error", Object.assign(new Error("missing"), { code: "ENOENT" })));
+      return missing;
+    },
+  }), /Install.*opencode --version/iu);
+  assert.equal(calls, 1);
+  await assert.rejects(startOpenCodeServer({ workingDirectory: "/work" }, {
+    checkOpenCode: async () => "OpenCode 3.0.0", spawn: () => assert.fail("unsupported serve"),
+  }), /Unsupported/iu);
+});
+
+for (const major of [1, 2]) for (const directory of ["/wrong", ".", ""]) test(`U1 workspace identity rejects v${major} directory ${JSON.stringify(directory)}`, async () => {
+  await assert.rejects(startSocketOpenCodeServer({ workingDirectory: process.cwd() }, {
+    attachUrl: "http://localhost:5555", environment: {},
+    fetch: async (url) => {
+      const pathname = new URL(url).pathname;
+      if (pathname === "/global/health") return major === 1 ? jsonResponse({ healthy: true, version: "1.19.0" }) : new Response("<html>");
+      if (pathname === "/api/info") return jsonResponse(v2Info);
+      if (pathname === "/api/experimental/migration/v1") return jsonResponse({ status: "completed" });
+      if (pathname === "/session/status") assert.fail("Invalid location must fail before status readiness");
+      return jsonResponse({ ...v2Location, directory });
+    },
+  }), /workspace identity mismatch|location protocol|workspace protocol/iu);
+});
+
+test("U1 executor uses negotiated private auth instead of ambient credentials", async () => {
+  const executor = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", environment: { OPENCODE_SERVER_PASSWORD: "ambient" },
+    connection: { major: 1, headers: { authorization: "Basic negotiated" } },
+    fetch: async (_url, init) => { assert.equal(init.headers.authorization, "Basic negotiated"); return jsonResponse({}, 500); },
+  });
+  await assert.rejects(executor.runTurn({ prompt: "test", workingDirectory: "/work" }), /status 500/u);
+});
+
+test("U1 Managed distinguishes temporary readiness from permanent auth/protocol errors", async () => {
+  for (const status of [503, 401, 200]) {
+    const child = childProcess();
+    let killed = false;
+    child.kill = () => { killed = true; queueMicrotask(() => child.emit("close", 0)); return true; };
+    const server = await startOpenCodeServer({ workingDirectory: "/work", openCodeHostname: "127.0.0.1", openCodePort: 4096 }, {
+      checkOpenCode: async () => "1.19.0", spawn: () => child, startupTimeoutMs: 10,
+      fetch: async () => jsonResponse({}, status),
+    });
+    await assert.rejects(server.ready(), (error) => (error instanceof OpenCodeReadinessError) === (status === 503));
+    assert.equal(killed, false, "readiness alone must not end ordinary Managed lifetime");
+    server.stop(); await server.wait();
+  }
+});
+
 test("starts one owned loopback server on port 0 and stops it", async () => {
   let invocation;
   let killed = false;
@@ -38,9 +239,12 @@ test("starts one owned loopback server on port 0 and stops it", async () => {
   };
   const requests = [];
   const started = startSocketOpenCodeServer({ workingDirectory: "/work" }, {
+    checkOpenCode: async () => "1.19.0",
     environment: { PATH: "/bin", PIPA_SLACK_BOT_TOKEN: "secret" },
     fetch: async (url) => {
       requests.push(String(url));
+      if (new URL(url).pathname === "/global/health") return jsonResponse({ healthy: true, version: "1.19.0" });
+      if (new URL(url).pathname === "/path") return jsonResponse({ directory: "/work" });
       return jsonResponse({});
     },
     spawn(command, args, options) {
@@ -58,7 +262,7 @@ test("starts one owned loopback server on port 0 and stops it", async () => {
   assert.equal(invocation.options.env.PIPA_SLACK_BOT_TOKEN, undefined);
   assert.equal(child.stdout.readableFlowing, true);
   assert.equal(child.stderr.readableFlowing, true);
-  assert.deepEqual(requests, ["http://127.0.0.1:54321/session/status?directory=%2Fwork"]);
+   assert.deepEqual(requests, ["http://127.0.0.1:54321/global/health", "http://127.0.0.1:54321/path?directory=%2Fwork", "http://127.0.0.1:54321/session/status?directory=%2Fwork"]);
   server.stop("SIGTERM");
   await server.wait();
   assert.equal(killed, true);
@@ -75,6 +279,8 @@ test("checks an authenticated attached workspace without owning it", async () =>
     },
     fetch: async (url, init) => {
       requests.push({ url: String(url), init });
+      if (new URL(url).pathname === "/global/health") return jsonResponse({ healthy: true, version: "1.19.0" });
+      if (new URL(url).pathname === "/path") return jsonResponse({ directory: "/work" });
       return jsonResponse({});
     },
     spawn: () => { spawned = true; },
@@ -83,7 +289,7 @@ test("checks an authenticated attached workspace without owning it", async () =>
   assert.equal(server.baseUrl, "http://localhost:5555");
   assert.equal(server.owned, false);
   assert.equal(spawned, false);
-  assert.deepEqual(requests.map(({ url }) => url), ["http://localhost:5555/session/status?directory=%2Fwork"]);
+  assert.deepEqual(requests.map(({ url }) => url), ["http://localhost:5555/global/health", "http://localhost:5555/path?directory=%2Fwork", "http://localhost:5555/session/status?directory=%2Fwork"]);
   assert.ok(requests.every(({ init }) => init.headers.authorization === `Basic ${Buffer.from("pipa:secret").toString("base64")}`));
   server.stop();
   await server.wait();
@@ -98,6 +304,7 @@ for (const mode of ["attached", "owned"]) test(`cancels ${mode} Socket workspace
     return true;
   };
   const starting = startSocketOpenCodeServer({ workingDirectory: "/work" }, {
+    checkOpenCode: async () => "1.19.0",
     signal: controller.signal,
     environment: mode === "attached" ? { PIPA_OPENCODE_ATTACH_URL: "http://localhost:5555" } : {},
     fetch: async (_url, { signal }) => {
@@ -123,6 +330,7 @@ test("cleans up an owned child when workspace readiness never succeeds", async (
     return true;
   };
   await assert.rejects(startSocketOpenCodeServer({ workingDirectory: "/work" }, {
+    checkOpenCode: async () => "1.19.0",
     startupTimeoutMs: 5,
     fetch: async () => jsonResponse({}, 503),
     spawn: () => {
@@ -141,10 +349,13 @@ test("waits for a valid workspace status response", async () => {
     return true;
   };
   const server = await startSocketOpenCodeServer({ workingDirectory: "/work" }, {
+    checkOpenCode: async () => "1.19.0",
     startupTimeoutMs: 1_000,
-    fetch: async () => {
+    fetch: async (url) => {
+      if (new URL(url).pathname === "/global/health") return jsonResponse({ healthy: true, version: "1.19.0" });
+      if (new URL(url).pathname === "/path") return jsonResponse({ directory: "/work" });
       statusReads += 1;
-      return jsonResponse(statusReads === 1 ? { healthy: true } : {});
+      return jsonResponse({}, statusReads === 1 ? 503 : 200);
     },
     spawn: () => {
       queueMicrotask(() => child.stdout.write("opencode server listening on http://127.0.0.1:54321\n"));
@@ -446,7 +657,8 @@ test("Managed server inherits its clean environment and forwards termination sig
       queueMicrotask(() => child.emit("close", 1));
       return true;
     };
-    const server = startOpenCodeServer({ workingDirectory: "/work", openCodeHostname: "127.0.0.1", openCodePort: 4096 }, {
+    const server = await startOpenCodeServer({ workingDirectory: "/work", openCodeHostname: "127.0.0.1", openCodePort: 4096 }, {
+      checkOpenCode: async () => "1.19.0",
       environment: { OPENCODE_DB: "/work/opencode.db", PIPA_SLACK_BOT_TOKEN: "secret", OPENAI_API_KEY: "provider-secret" },
       platform: "linux",
       spawn(command, args, options) {
@@ -469,14 +681,17 @@ test("Managed readiness checks workspace health, authentication and a bounded de
     const child = childProcess();
     child.kill = () => { queueMicrotask(() => child.emit("close", 0)); return true; };
     let requests = 0;
-    const server = startOpenCodeServer({ workingDirectory: "/work", openCodeHostname: "127.0.0.1", openCodePort: 4096 }, {
+    const server = await startOpenCodeServer({ workingDirectory: "/work", openCodeHostname: "127.0.0.1", openCodePort: 4096 }, {
+      checkOpenCode: async () => "1.19.0",
       platform: "linux", spawn: () => child, startupTimeoutMs: healthy ? 1_000 : 10,
       environment: { OPENCODE_SERVER_PASSWORD: "test-password" },
       fetch: async (url, init) => {
+        if (new URL(url).pathname === "/global/health") return jsonResponse({ healthy: true, version: "1.19.0" });
+        if (new URL(url).pathname === "/path") return jsonResponse({ directory: "/work" });
         requests += 1;
         assert.equal(String(url), "http://127.0.0.1:4096/session/status?directory=%2Fwork");
         assert.equal(init.headers.authorization, `Basic ${Buffer.from("opencode:test-password").toString("base64")}`);
-        return jsonResponse(healthy && requests > 1 ? {} : { ok: true });
+        return jsonResponse({}, healthy && requests > 1 ? 200 : 503);
       },
     });
     try {
@@ -488,12 +703,12 @@ test("Managed readiness checks workspace health, authentication and a bounded de
 
 test("Managed server propagates spawn errors and unexpected exits", async () => {
   const spawnFailure = childProcess();
-  const failedServer = startOpenCodeServer({ workingDirectory: "/work", openCodeHostname: "localhost", openCodePort: 4096 }, { spawn: () => spawnFailure });
+  const failedServer = await startOpenCodeServer({ workingDirectory: "/work", openCodeHostname: "localhost", openCodePort: 4096 }, { checkOpenCode: async () => "1.19.0", spawn: () => spawnFailure });
   queueMicrotask(() => spawnFailure.emit("error", new Error("OpenCode unavailable")));
   await assert.rejects(failedServer.wait(), /OpenCode unavailable/u);
 
   const exited = childProcess();
-  const exitedServer = startOpenCodeServer({ workingDirectory: "/work", openCodeHostname: "localhost", openCodePort: 4096 }, { spawn: () => exited });
+  const exitedServer = await startOpenCodeServer({ workingDirectory: "/work", openCodeHostname: "localhost", openCodePort: 4096 }, { checkOpenCode: async () => "1.19.0", spawn: () => exited });
   queueMicrotask(() => exited.emit("close", 23));
   await assert.rejects(exitedServer.wait(), /exited unexpectedly with code 23/u);
 });
@@ -508,7 +723,8 @@ test("Windows server shutdown falls back when taskkill is unavailable", async ()
   };
   const server = await startSocketOpenCodeServer({ workingDirectory: "/work" }, {
     platform: "win32",
-    fetch: async () => jsonResponse({}),
+    checkOpenCode: async () => "1.19.0",
+    fetch: async (url) => jsonResponse(new URL(url).pathname === "/global/health" ? { healthy: true, version: "1.19.0" } : new URL(url).pathname === "/path" ? { directory: "/work" } : {}),
     spawn: () => {
       queueMicrotask(() => child.stdout.write("opencode server listening on http://127.0.0.1:54321\n"));
       return child;

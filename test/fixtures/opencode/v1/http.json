@@ -11,6 +11,10 @@
   "continuation": { "sessionId": "ses_contract", "text": "history retained" },
   "routes": [
     {
+      "method": "GET", "path": "/path", "query": { "directory": "$WORKSPACE" },
+      "responses": [{ "json": { "directory": "$WORKSPACE", "worktree": "$WORKSPACE", "home": "$TEMP", "state": "$TEMP", "config": "$TEMP" } }]
+    },
+    {
       "method": "GET", "path": "/global/health",
       "responses": [{ "json": { "healthy": true, "version": "1.19.0" } }]
     },

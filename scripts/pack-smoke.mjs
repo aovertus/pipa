@@ -2,6 +2,7 @@ import crossSpawn from "cross-spawn";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { createServer } from "node:net";
 import { pathToFileURL } from "node:url";
 
 const directory = await mkdtemp(path.join(os.tmpdir(), "pipa-pack-"));
@@ -33,13 +34,20 @@ try {
     mkdir(workingDirectory),
     mkdir(fakeBin),
   ]);
+  const reservation = createServer();
+  await new Promise((resolve, reject) => {
+    reservation.once("error", reject);
+    reservation.listen(0, "127.0.0.1", resolve);
+  });
+  const managedPort = reservation.address().port;
+  await new Promise((resolve) => reservation.close(resolve));
   const fakeScript = path.join(fakeBin, "fake-opencode.cjs");
   await writeFile(fakeScript, `
 const fs = require("node:fs");
 if (process.argv[2] === "--version") {
   console.log("1.0.0");
 } else {
-  const expectedArgs = ["serve", "--hostname", "127.0.0.1", "--port", "4096", "--log-level", "ERROR"];
+  const expectedArgs = ["serve", "--hostname", "127.0.0.1", "--port", ${JSON.stringify(String(managedPort))}, "--log-level", "ERROR"];
   const environmentKeys = ["OPENCODE_DB", "OPENCODE_CONFIG_CONTENT", "PIPA_API_BASE_URL", "PIPA_EXECUTION_SECRET", "COMPOSIO_API_KEY", "OPENAI_API_KEY"];
   if (JSON.stringify(process.argv.slice(2)) !== JSON.stringify(expectedArgs)) throw new Error("Unexpected Managed OpenCode arguments.");
   if (process.cwd() !== process.env.EXPECTED_CWD) throw new Error("Unexpected Managed OpenCode working directory.");
@@ -116,7 +124,7 @@ if (process.argv[2] === "--version") {
     workingDirectory: managedWorkingDirectory,
     slackMode: "managed",
     openCodeHostname: "127.0.0.1",
-    openCodePort: 4096,
+    openCodePort: managedPort,
   }));
   let managedError;
   try {
@@ -136,7 +144,10 @@ if (process.argv[2] === "--version") {
   } catch (error) {
     managedError = error;
   }
-  if (await readFile(assertionFile, "utf8") !== "managed-ok") throw new Error("Packed Managed start did not run OpenCode.");
+  const managedAssertion = await readFile(assertionFile, "utf8").catch((error) => {
+    throw new Error(`Packed Managed start did not run OpenCode: ${managedError?.message ?? error.message}`, { cause: managedError ?? error });
+  });
+  if (managedAssertion !== "managed-ok") throw new Error("Packed Managed start did not run OpenCode.");
   if (!managedError?.message.includes("OpenCode server exited unexpectedly with code 23")) throw new Error("Packed Managed start did not propagate the OpenCode exit.");
   if (managedError.message.includes("pack-sentinel")) throw new Error("Packed Managed start exposed an environment secret.");
   process.stdout.write(`Packed CLI ${stdout.trim()} installed, loaded its runtimes, previewed a routine, initialized, cancelled, and ran Managed start successfully.\n`);

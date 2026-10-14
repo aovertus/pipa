@@ -5,16 +5,53 @@ import path from "node:path";
 import { createRuntimeFixture, waitFor, FIXTURE_TEARDOWN_TIMEOUT_MS } from "../../test/helpers/runtime-fixture.mjs";
 import { assertTurnOutcome } from "../../test/helpers/opencode-contract.mjs";
 import { assertPin, compatibilityExit, selectGate, recordCase, finishCell, CELL_WORKER_TIMEOUT_MS, PINS, MODES } from "../test-opencode-matrix.mjs";
-import { releaseCases } from "./opencode-release-cases.mjs";
+import { observeRuntimeReadiness, releaseCases, runCell } from "./opencode-release-cases.mjs";
+import { checkOpenCodeConnection } from "../../src/opencode.mjs";
+import { createWireFixture, loadWireFixture } from "../../test/helpers/opencode-contract.mjs";
 import { createProvider } from "./opencode-provider.mjs";
 import { command } from "../test-opencode-matrix.mjs";
 import { fileURLToPath } from "node:url";
 import { journal, windowsTree } from "../../test/helpers/runtime-ownership.mjs";
 
+const facade = { checkOpenCodeConnection };
+
 test("wrong reported pin fails, including prefixed output", () => {
   assertPin("OpenCode 2.0.29", "2.0.29");
   assert.throws(() => assertPin("1.19.0", "1.18.35"));
   assert.throws(() => assertPin("2.0.29\n1.18.35", "2.0.29"));
+});
+
+test("native readiness observer validates generation, auth, migration and configured workspace", async () => {
+  const runtime = await createRuntimeFixture();
+  try {
+    for (const generation of ["v1", "v2"]) {
+      const document = await loadWireFixture(generation, runtime);
+      const wire = createWireFixture(document);
+      const identityPath = generation === "v1" ? "/global/health" : "/api/info";
+      const calls = [];
+      const connection = await observeRuntimeReadiness({ facade, baseUrl: "http://127.0.0.1:4096", workingDirectory: runtime.workspace, environment: { OPENCODE_SERVER_PASSWORD: "synthetic" }, pin: document.version,
+        fetch: (url, init) => {
+          calls.push({ path: new URL(url).pathname, authenticated: Boolean(init.headers?.authorization) });
+          if (!init.headers?.authorization) return Promise.resolve(Response.json({}, { status: 401 }));
+          return wire.fetch(url, init);
+        },
+      });
+      assert.equal(connection.major, generation === "v1" ? 1 : 2);
+      assert.equal(connection.workingDirectory, runtime.workspace);
+      assert.deepEqual(calls.at(-1), { path: identityPath, authenticated: false });
+    }
+    const common = { facade, baseUrl: "http://127.0.0.1:4096", workingDirectory: runtime.workspace, environment: { OPENCODE_SERVER_PASSWORD: "synthetic" }, pin: "2.0.29", startupTimeoutMs: 20 };
+    for (const defect of ["pin", "location", "migration", "unauthenticated", "HTML"]) {
+      await assert.rejects(observeRuntimeReadiness({ ...common, fetch: async (url, init) => {
+        const pathname = new URL(url).pathname;
+        if (!init.headers?.authorization) return Response.json({}, { status: defect === "unauthenticated" ? 200 : 401 });
+        if (pathname === "/global/health") return new Response("<html>");
+        if (pathname === "/api/info") return defect === "HTML" ? new Response("<html>") : Response.json({ version: defect === "pin" ? "2.0.30" : "2.0.29", pid: 1, urls: [], paths: { tmp: runtime.temp } });
+        if (pathname === "/api/experimental/migration/v1") return Response.json({ status: defect === "migration" ? "running" : "completed", progress: { label: "history" } });
+        return Response.json({ directory: defect === "location" ? runtime.home : runtime.workspace, project: { id: "prj_test", directory: runtime.workspace, canonical: runtime.workspace } });
+      } }), defect === "pin" ? /exact pin/u : defect === "location" ? /workspace identity mismatch/u : defect === "migration" ? /migration.*timed out/u : defect === "unauthenticated" ? /require authentication/u : /identity protocol/u);
+    }
+  } finally { await runtime.teardown(); }
 });
 
 const gateFixture = () => ({
@@ -23,6 +60,15 @@ const gateFixture = () => ({
     cases: releaseCases.map((definition) => ({ id: definition.id, status: definition.lane === "live" || !definition.modes.includes(mode) ? "BLOCKED" : !definition.generations.includes(engine.split(".")[0]) ? "NOT_APPLICABLE" : "PASS", observed: "fixture" })),
   }))),
   unobservedPlatforms: [{ platform: "linux", status: "BLOCKED", observed: "separate host required" }],
+});
+
+test("targeted cell diagnostics reject invalid selections and cannot qualify the full gate", async () => {
+  for (const caseIds of [[], ["unknown"], ["startup-readiness", "startup-readiness"], "startup-readiness"]) await assert.rejects(runCell({ caseIds }), /Invalid targeted case selection/u);
+  const report = gateFixture();
+  report.cells[0].collection = "targeted-diagnostic";
+  report.cells[0].caseSelection = ["startup-readiness", "stop-ownership"];
+  report.cells[0].cases = report.cells[0].cases.filter((row) => report.cells[0].caseSelection.includes(row.id));
+  assert.equal(selectGate(report).exitCode, 1, "Missing turn/recovery cases must remain gating");
 });
 
 test("declarative gates select applicable cases across every mode and generation without mutating evidence", () => {

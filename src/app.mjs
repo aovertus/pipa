@@ -4,7 +4,7 @@ import { Chat, Modal, TextInput } from "chat";
 import { createSlackAdapter } from "@chat-adapter/slack";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { canonicalWorkingDirectory, createManifest, createSessionStore, loadConfig, pipaPaths, saveConfig } from "./state.mjs";
-import { createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, PipaRestartingError, PipaStoppedError, runOpenCodeVersion, startSocketOpenCodeServer } from "./opencode.mjs";
+import { checkOpenCodeConnection, createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, parseOpenCodeVersion, PipaRestartingError, PipaStoppedError, runOpenCodeVersion, startSocketOpenCodeServer } from "./opencode.mjs";
 import { assertRoutineDestinationAllowed, createRoutineScheduler, loadRoutineState } from "./routines.mjs";
 
 class RoutineDeniedError extends Error {}
@@ -21,8 +21,10 @@ export async function initializePipa(input, options = {}) {
     allowedSlackUserIds: normalizeIdList(input.allowedSlackUserIds),
     allowedSlackBotIds: normalizeIdList(input.allowedSlackBotIds),
   };
-  const openCodeVersion = await (options.checkOpenCode ?? runOpenCodeVersion)();
-  if (!/^v?1(?:\.|$)/u.test(openCodeVersion)) throw new Error(`Pipa requires OpenCode v1; found ${openCodeVersion || "an unknown version"}.`);
+  const environment = options.environment ?? process.env;
+  const attachUrl = environment.PIPA_OPENCODE_ATTACH_URL?.trim();
+  if (attachUrl) await checkOpenCodeConnection(attachUrl, config.workingDirectory, options);
+  else parseOpenCodeVersion(await (options.checkOpenCode ?? runOpenCodeVersion)(options));
   await (options.checkSlackAppToken ?? checkSlackAppToken)(config.slackAppToken);
   const slackAuth = await (options.checkSlackToken ?? checkSlackToken)(config.slackBotToken);
   warnMissingSlackScopes(slackAuth, options.warn);
@@ -66,6 +68,7 @@ export async function startPipa(options = {}) {
     executor = options.executor ?? (options.createExecutor ?? createOpenCodeExecutor)({
       artifactRoot: path.join(config.workingDirectory, ".pipa", "artifacts"),
       baseUrl: server.baseUrl,
+      connection: server.connection,
       onFatal: server.fail,
     });
   } catch (error) {

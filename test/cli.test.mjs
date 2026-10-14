@@ -9,8 +9,56 @@ import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { acquireInstanceLock, pipaPaths, readInstanceLock, writePrivateJson } from "../src/state.mjs";
 import { restartStatus } from "../src/restart.mjs";
+import { createRuntimeFixture } from "./helpers/runtime-fixture.mjs";
 
 const cli = fileURLToPath(new URL("../bin/pipa.mjs", import.meta.url));
+
+for (const failure of ["authentication", "protocol", "temporary"]) test(`U1 ordinary Managed readiness policy: ${failure}`, { timeout: 45000 }, async (t) => {
+  const runtime = await createRuntimeFixture({ timeoutMs: 42000 });
+  t.after(() => runtime.teardown());
+  const paths = pipaPaths(runtime.home);
+  const reservation = createServer();
+  await new Promise((resolve) => reservation.listen(0, "127.0.0.1", resolve));
+  const port = reservation.address().port;
+  await new Promise((resolve) => reservation.close(resolve));
+  const config = { botName: "Pipa", workingDirectory: runtime.workspace, slackMode: "managed", openCodeHostname: "127.0.0.1", openCodePort: port };
+  await writePrivateJson(paths.config, config);
+  const before = await readFile(paths.config, "utf8");
+  const fakeBin = path.join(runtime.root, "bin");
+  await mkdir(fakeBin);
+  const script = path.join(fakeBin, "fake.cjs");
+  await writeFile(script, `
+    if (process.argv.includes('--version')) { console.log('OpenCode 1.19.0'); process.exit(0); }
+    const http = require('node:http');
+    const server = http.createServer((req, res) => { res.writeHead(${failure === "authentication" ? 401 : failure === "temporary" ? 503 : 200}, { 'content-type': 'application/json' }); res.end('{}'); });
+    server.listen(Number(process.argv[process.argv.indexOf('--port') + 1]), '127.0.0.1');
+    process.on('SIGTERM', () => server.close());
+  `);
+  const executable = path.join(fakeBin, process.platform === "win32" ? "opencode.cmd" : "opencode");
+  await writeFile(executable, process.platform === "win32" ? `@ECHO off\r\n"${process.execPath}" "%~dp0fake.cjs" %*\r\n` : `#!/bin/sh\nexec "${process.execPath}" "${script}" "$@"\n`);
+  if (process.platform !== "win32") await chmod(executable, 0o755);
+  runtime.env.PATH = `${fakeBin}${path.delimiter}${runtime.env.PATH}`;
+  const { child, exited } = runtime.spawn(process.execPath, [cli, "start"]);
+  let stderr = "";
+  child.stderr.on("data", (data) => { stderr += data; });
+  if (failure === "temporary") {
+    await runtime.waitFor(() => stderr.includes("Managed restart unavailable"), { timeoutMs: 35000, label: "temporary readiness policy" });
+    assert.equal(child.exitCode, null);
+    assert.ok(await readInstanceLock(paths.lock));
+    const request = spawnSync(process.execPath, [cli, "restart"], { env: runtime.env, encoding: "utf8" });
+    assert.equal(request.status, 0, request.stderr);
+    await delay(300);
+    assert.equal((await restartStatus({ home: runtime.home })).state, "requested", "unready Managed must not claim restart readiness");
+    child.kill("SIGTERM");
+    assert.equal((await exited).code, 0);
+  } else {
+    assert.equal((await exited).code, 1);
+    assert.match(stderr, failure === "authentication" ? /authentication failed/iu : /identity protocol/iu);
+    assert.doesNotMatch(stderr, /Managed restart unavailable/u);
+  }
+  assert.equal(await readInstanceLock(paths.lock), null);
+  assert.equal(await readFile(paths.config, "utf8"), before);
+});
 
 test("restart requests rather than claims success and status survives the caller", async (t) => {
   const home = await mkdtemp(path.join(os.tmpdir(), "pipa-restart-cli-"));
@@ -52,13 +100,14 @@ for (const mode of ["ready", "unready", "startup-failure"]) test(`isolated Manag
   const configBefore = await readFile(paths.config, "utf8");
   await writeFile(path.join(fakeBin, "server.cjs"), `
     const http = require('node:http');
+    if (process.argv.includes('--version')) { console.log('OpenCode 1.19.0'); process.exit(0); }
     if (process.env.PIPA_HOME !== ${JSON.stringify(home)}) throw new Error('Profile home changed in the tool environment.');
     if (process.env.PIPA_RESTART_ID && ${JSON.stringify(mode)} === 'startup-failure') process.exit(23);
     const server = http.createServer((req, res) => {
       if (req.url === '/shutdown') { res.end(); server.close(); return; }
       if (process.env.PIPA_RESTART_ID && ${JSON.stringify(mode)} === 'unready') res.statusCode = 503;
       res.setHeader('content-type', 'application/json');
-      res.end(JSON.stringify({}));
+      res.end(JSON.stringify(req.url === '/global/health' ? { healthy: true, version: '1.19.0' } : req.url.startsWith('/path?') ? { directory: ${JSON.stringify(home)} } : {}));
     });
     server.listen(Number(process.argv[process.argv.indexOf('--port') + 1]), '127.0.0.1');
     process.on('SIGTERM', () => server.close());

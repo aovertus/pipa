@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -7,7 +7,8 @@ import { createSlackAdapter } from "@chat-adapter/slack";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { Chat } from "chat";
 import { checkSlackAppToken, checkSlackToken, createConversationRunner, createPendingInteractions, initializePipa, postResult, slackDestinationId, startPipa as startPipaRuntime } from "../src/app.mjs";
-import { PipaRestartingError, PipaStoppedError } from "../src/opencode.mjs";
+import { PipaRestartingError, PipaStoppedError, startSocketOpenCodeServer } from "../src/opencode.mjs";
+import { createRuntimeFixture } from "./helpers/runtime-fixture.mjs";
 import { createRoutineScheduler, normalizeRoutine } from "../src/routines.mjs";
 import { createSessionStore, pipaPaths, writePrivateJson } from "../src/state.mjs";
 
@@ -26,7 +27,7 @@ test("init validates dependencies before replacing config", async () => {
   const failures = [
     () => initializePipa({ ...input, workingDirectory: file }, valid),
     () => initializePipa(input, { ...valid, checkOpenCode: async () => { throw new Error("OpenCode missing"); } }),
-    () => initializePipa(input, { ...valid, checkOpenCode: async () => "2.0.0" }),
+    () => initializePipa(input, { ...valid, checkOpenCode: async () => "3.0.0" }),
     () => initializePipa(input, { ...valid, checkSlackAppToken: async () => { throw new Error("app rejected"); } }),
     () => initializePipa({ ...input, slackBotToken: "xoxb-rejected" }, { ...valid, checkSlackToken: async () => { throw new Error("bot rejected"); } }),
   ];
@@ -36,6 +37,67 @@ test("init validates dependencies before replacing config", async () => {
     assert.equal(await readFile(paths.manifest, "utf8"), manifestBefore);
   }
   assert.doesNotMatch(before.replace("xapp-test", "").replace("xoxb-test", ""), /xoxb|xapp/u);
+});
+
+for (const version of ["OpenCode v1.19.0", "OpenCode 2.0.29"]) test(`init accepts qualified CLI identity: ${version}`, async (t) => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "pipa-init-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  await initializePipa({ botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: home }, {
+    paths: pipaPaths(home), checkOpenCode: async () => version,
+    checkSlackAppToken: async () => ({ ok: true }), checkSlackToken: async () => ({ ok: true }),
+  });
+  assert.equal(JSON.parse(await readFile(pipaPaths(home).config, "utf8")).botName, "Pipa");
+});
+
+for (const migration of ["required", "running", "error"]) test(`U1 Socket migration ${migration} preserves state and blocks subscriptions/scheduler`, async (t) => {
+  const runtime = await createRuntimeFixture();
+  t.after(() => runtime.teardown());
+  const paths = pipaPaths(runtime.home);
+  const config = { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: runtime.workspace };
+  await writePrivateJson(paths.config, config);
+  await writePrivateJson(paths.sessions, { "slack:C1:1": "ses_history" });
+  await writePrivateJson(paths.routines, { version: 1, routines: [] });
+  const files = [paths.config, paths.sessions, paths.routines];
+  const before = await Promise.all(files.map((file) => readFile(file, "utf8")));
+  let initialized = false;
+  let scheduler = false;
+  let subscribed = false;
+  await assert.rejects(startPipaRuntime({
+    paths, config, startupTimeoutMs: 20, checkSlackToken: async () => ({ ok: true }),
+    chat: { initialize() { initialized = true; }, thread() { subscribed = true; } },
+    createRoutineScheduler() { scheduler = true; },
+    startServer: (config, options) => startSocketOpenCodeServer(config, { ...options,
+      attachUrl: "http://localhost:5555", environment: {},
+      fetch: async (url) => {
+        const pathname = new URL(url).pathname;
+        if (pathname === "/global/health") return new Response("<html>");
+        if (pathname === "/api/info") return Response.json({ version: "2.0.29", pid: 1, urls: [], paths: { tmp: "/tmp" } });
+        assert.equal(pathname, "/api/experimental/migration/v1");
+        return Response.json({ status: migration, progress: { label: "history" }, error: "not for logs" });
+      },
+    }),
+  }), /migration/iu);
+  assert.equal(initialized || scheduler || subscribed, false);
+  assert.deepEqual(await Promise.all(files.map((file) => readFile(file, "utf8"))), before);
+});
+
+test("U1 init attached identity ignores local CLI and preserves config on auth failure", async (t) => {
+  const runtime = await createRuntimeFixture();
+  t.after(() => runtime.teardown());
+  const paths = pipaPaths(runtime.home);
+  const input = { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: runtime.workspace };
+  const options = { paths, environment: { PIPA_OPENCODE_ATTACH_URL: "http://localhost:5555" },
+    checkOpenCode: () => assert.fail("must not read local version"), checkSlackAppToken: async () => ({}), checkSlackToken: async () => ({}) };
+  await initializePipa(input, { ...options, fetch: async (url) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/global/health") return new Response("<html>");
+    if (pathname === "/api/info") return Response.json({ version: "2.0.29", pid: 1, urls: [], paths: { tmp: "/tmp" } });
+    if (pathname === "/api/experimental/migration/v1") return Response.json({ status: "completed" });
+    return Response.json({ directory: runtime.workspace, project: { id: "prj_test", directory: runtime.workspace, canonical: runtime.workspace } });
+  } });
+  const before = await readFile(paths.config, "utf8");
+  await assert.rejects(initializePipa(input, { ...options, fetch: async () => Response.json({}, { status: 401 }) }), /authentication/iu);
+  assert.equal(await readFile(paths.config, "utf8"), before);
 });
 
 test("Slack auth errors never include the token", async () => {
@@ -145,6 +207,7 @@ test("starts and health-checks OpenCode before Slack, then stops only the owned 
   });
   const server = {
     baseUrl: "http://127.0.0.1:54321",
+    connection: { major: 1, version: "1.19.0", headers: { authorization: "synthetic" } },
     owned: true,
     wait: () => serverWait,
     fail: failServer,
@@ -168,10 +231,11 @@ test("starts and health-checks OpenCode before Slack, then stops only the owned 
       events.push("server:ready");
       return server;
     },
-    createExecutor: ({ artifactRoot, baseUrl, onFatal }) => {
+    createExecutor: ({ artifactRoot, baseUrl, onFatal, connection }) => {
       events.push(`executor:${baseUrl}`);
       assert.equal(artifactRoot, path.join("/work", ".pipa", "artifacts"));
       assert.equal(onFatal, server.fail);
+      assert.equal(connection, server.connection);
       return { runTurn: async () => undefined, stopAll: () => events.push("executor:stop") };
     },
   });

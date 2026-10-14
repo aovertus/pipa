@@ -12,6 +12,18 @@
   "continuation": { "sessionId": "ses_contract", "text": "history retained" },
   "routes": [
     {
+      "method": "GET", "path": "/global/health",
+      "responses": [{ "raw": "<!doctype html><html>OpenCode</html>", "contentType": "text/html" }]
+    },
+    {
+      "method": "GET", "path": "/api/experimental/migration/v1",
+      "responses": [{ "json": { "status": "completed" } }]
+    },
+    {
+      "method": "GET", "path": "/api/location", "query": { "location[directory]": "$WORKSPACE" },
+      "responses": [{ "json": { "directory": "$WORKSPACE", "project": { "id": "prj_contract", "directory": "$WORKSPACE", "canonical": "$WORKSPACE" } } }]
+    },
+    {
       "method": "POST", "path": "/session", "query": { "directory": "$WORKSPACE" }, "body": {},
       "responses": [{ "status": 405, "raw": "Method Not Allowed", "contentType": "text/plain" }]
     },
