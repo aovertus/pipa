@@ -190,6 +190,8 @@ npm run test:pack
 
 `npm run test:slack:routines` is a manual real-service smoke test. It requires a running local Socket Mode process plus `SLACK_USER_TOKEN`, `SLACK_TEST_CHANNEL_ID`, and `SLACK_PIPA_BOT_USER_ID`; it is not part of automatic CI.
 
+See the [testing strategy](docs/pipa-testing.md) for repeatable real-runtime and Slack validation, existing-app reuse, evidence, and cleanup.
+
 See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
 
 See the [repository overview](docs/repository-overview.md) for a file-by-file explanation of how Pipa works.
