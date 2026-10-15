@@ -785,7 +785,7 @@ test("failed artifact post retries declaration-free text once without files", as
   await delivery.app.shutdown();
 });
 
-test("interrupted Slack messages keep their eyes until the latest turn succeeds", async () => {
+test("interrupted Slack messages lose their eyes without a stale success reaction", async () => {
   const handlers = {};
   const reactions = [];
   const posts = [];
@@ -836,10 +836,10 @@ test("interrupted Slack messages keep their eyes until the latest turn succeeds"
   assert.deepEqual(reactions, ["add:1:eyes", "add:2:eyes"]);
 
   finishSecond();
-  await waitFor(() => reactions.length === 6);
+  await waitFor(() => reactions.includes("add:2:white_check_mark"));
   assert.deepEqual(reactions, [
     "add:1:eyes", "add:2:eyes",
-    "remove:1:eyes", "add:1:white_check_mark",
+    "remove:1:eyes",
     "remove:2:eyes", "add:2:white_check_mark",
   ]);
   assert.deepEqual(posts, [{ markdown: "second complete" }]);

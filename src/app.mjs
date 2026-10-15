@@ -173,7 +173,7 @@ export async function startPipa(options = {}) {
     const pending = pendingReactions.get(conversationKey) ?? [];
     if (pending.at(-1)?.message !== currentMessage) return;
     pendingReactions.delete(conversationKey);
-    for (const entry of pending) await finishReaction(entry.thread, entry.message, entry.message === currentMessage ? emoji : "white_check_mark");
+    for (const entry of pending) await finishReaction(entry.thread, entry.message, entry.message === currentMessage ? emoji : null);
   };
 
   const handle = async (thread, message, subscribe) => {

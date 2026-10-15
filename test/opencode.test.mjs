@@ -1320,16 +1320,19 @@ test("artifact directories are cleaned after OpenCode failure and cancellation",
   for (const mode of ["failure", "cancel"]) {
     let directory;
     let executor;
+    const acknowledge = Promise.withResolvers();
     const fetch = artifactFetch(async (body, init) => {
       directory = artifactPath(body.system);
       if (mode === "failure") throw new Error("prompt failed");
-      return new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }));
+      await acknowledge.promise;
+      return "cancelled";
     });
     executor = createOpenCodeExecutor({ artifactRoot: os.tmpdir(), baseUrl: "http://localhost:5555", fetch });
     const turn = executor.runTurn({ prompt: "work", sessionId: "ses_1", workingDirectory: os.tmpdir(), contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack" } });
     if (mode === "cancel") {
       await waitForValue(() => directory);
       executor.stopAll();
+      acknowledge.resolve();
     }
     await assert.rejects(turn);
     await assert.rejects(access(directory));

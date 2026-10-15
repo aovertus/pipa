@@ -2,7 +2,9 @@ import { setTimeout as delay } from "node:timers/promises";
 
 // The facade owns files, controllers and caller callbacks; this adapter owns v1 wire data.
 export function createV1Adapter({ request, baseUrl, fetchImpl, headers, pollIntervalMs }) {
+  let blocked;
   return {
+    async ready() { if (blocked) throw blocked; },
     async resolveSession(sessionId, workingDirectory, controller) {
       let messages = [];
       if (sessionId) {
@@ -38,37 +40,79 @@ export function createV1Adapter({ request, baseUrl, fetchImpl, headers, pollInte
     async execute({ sessionId, baseline, workingDirectory, controller, prompt, files, instructions, onInteraction, onPermissionReplied, onPermissionsReconciled }) {
       let dismissed = false;
       let permissionRejected = false;
-      if (onInteraction) {
-        await watchInteractions({ baseUrl, fetchImpl, headers, sessionId, workingDirectory, controller,
-          onInteraction, onPermissionReplied, onPermissionsReconciled,
-          onPermissionRejected: () => { permissionRejected = true; }, onDismiss: () => { dismissed = true; }, requestTurn: request }).ready;
-      }
-      await request(`/session/${encodeURIComponent(sessionId)}/prompt_async`, {
-        method: "POST", body: JSON.stringify({ parts: [{ type: "text", text: prompt }, ...files.map((file) => ({ type: "file", ...file }))], system: instructions }),
-      }, workingDirectory, controller, [204]);
-      while (true) {
-        const [messages, statuses] = await Promise.all([
-          request(`/session/${encodeURIComponent(sessionId)}/message?limit=1`, { method: "GET" }, workingDirectory, controller),
-          request("/session/status", { method: "GET" }, workingDirectory, controller),
-        ]);
-        if (!Array.isArray(messages)) throw new Error("OpenCode returned an invalid message projection.");
-        const message = messages.findLast((message) => message?.info?.id && !baseline.has(message.info.id) && message.info.role === "assistant");
-        const status = statuses?.[sessionId]?.type;
-        if (dismissed && status !== "busy" && status !== "retry") return "";
-        if (["error", "failed", "cancelled"].includes(status) || message?.info.error) throw new Error("OpenCode failed to complete the turn.");
-        const completed = typeof message?.info.time?.completed === "number";
-        if (message && ((status !== "retry" && completed && message.info.finish === "stop") || status === "idle" || (!status && completed))) {
-          const text = message.parts.filter((part) => part.type === "text" && typeof part.text === "string" && part.text).map((part) => part.text).join("\n").trim();
-          if (!text && permissionRejected) return "Stopped after a permission was rejected.";
-          if (!text) throw new Error("OpenCode completed without assistant text.");
-          return text;
+      let watcher;
+      let admitting = false;
+      try {
+        if (onInteraction) {
+          watcher = watchInteractions({ baseUrl, fetchImpl, headers, sessionId, workingDirectory, controller,
+            onInteraction, onPermissionReplied, onPermissionsReconciled,
+            onPermissionRejected: () => { permissionRejected = true; }, onDismiss: () => { dismissed = true; }, requestTurn: request });
+          await watcher.ready;
         }
-        await delay(pollIntervalMs, undefined, { signal: controller.signal });
+        controller.signal.throwIfAborted();
+        admitting = true;
+        // Await bounded admission independently: cancelling its HTTP request could
+        // otherwise race a late server acceptance after native abort has returned.
+        const admission = new AbortController();
+        const timeout = setTimeout(() => admission.abort(new Error("OpenCode prompt admission timed out.")), 5_000);
+        try {
+          await request(`/session/${encodeURIComponent(sessionId)}/prompt_async`, {
+            method: "POST", body: JSON.stringify({ parts: [{ type: "text", text: prompt }, ...files.map((file) => ({ type: "file", ...file }))], system: instructions }),
+          }, workingDirectory, admission, [204]);
+        } catch (cause) {
+          if (cause.status === undefined) {
+            blocked = new Error("OpenCode prompt admission remains uncertain. New intake is blocked until the native work is reconciled.", { cause });
+            controller.abort(blocked);
+          }
+          throw cause;
+        } finally { clearTimeout(timeout); }
+        controller.signal.throwIfAborted();
+        while (true) {
+          const [messages, statuses] = await Promise.all([
+            request(`/session/${encodeURIComponent(sessionId)}/message?limit=1`, { method: "GET" }, workingDirectory, controller),
+            request("/session/status", { method: "GET" }, workingDirectory, controller),
+          ]);
+          if (!Array.isArray(messages)) throw new Error("OpenCode returned an invalid message projection.");
+          const message = messages.findLast((message) => message?.info?.id && !baseline.has(message.info.id) && message.info.role === "assistant");
+          const status = statuses?.[sessionId]?.type;
+          if (dismissed && status !== "busy" && status !== "retry") return "";
+          if (["error", "failed", "cancelled"].includes(status) || message?.info.error) throw new Error("OpenCode failed to complete the turn.");
+          const completed = typeof message?.info.time?.completed === "number";
+          if (message && ((status !== "retry" && completed && message.info.finish === "stop") || status === "idle" || (!status && completed))) {
+            const text = message.parts.filter((part) => part.type === "text" && typeof part.text === "string" && part.text).map((part) => part.text).join("\n").trim();
+            if (!text && permissionRejected) return "Stopped after a permission was rejected.";
+            if (!text) throw new Error("OpenCode completed without assistant text.");
+            return text;
+          }
+          await delay(pollIntervalMs, undefined, { signal: controller.signal });
+        }
+      } finally {
+        if (controller.signal.aborted && admitting) {
+          // Native abort leaves pending v1 questions behind, including child
+          // requests. Settle only sessions whose ancestry this turn verified.
+          const cleanup = { signal: AbortSignal.timeout(5_000) };
+          try {
+            await watcher?.done;
+            const sessions = watcher?.sessionIds ?? new Set([sessionId]);
+            await request(`/session/${encodeURIComponent(sessionId)}/abort`, { method: "POST" }, workingDirectory, cleanup, [200, 204, 404], false);
+            if (watcher) {
+              // The watcher stops on local cancellation, but a child may ask while
+              // the independent admission acknowledgement is still in flight.
+              const pending = await watcher.pending(cleanup);
+              await Promise.all([...sessions].filter((id) => id !== sessionId).map((id) => request(`/session/${encodeURIComponent(id)}/abort`, { method: "POST" }, workingDirectory, cleanup, [200, 204, 404], false)));
+              await Promise.all(pending.map(({ type, id }) => request(`/${type}/${encodeURIComponent(id)}/${type === "question" ? "reject" : "reply"}`, {
+                method: "POST", ...(type === "permission" ? { body: JSON.stringify({ reply: "reject" }) } : {}),
+              }, workingDirectory, cleanup, [200, 204, 404], false)));
+            }
+          } catch (cause) {
+            blocked = new Error("Pipa OpenCode cancellation failed. New intake is blocked until the native work is reconciled.", { cause });
+            throw blocked;
+          }
+        }
       }
     },
-    async abortTurn(sessionId, workingDirectory) {
-      await request(`/session/${encodeURIComponent(sessionId)}/abort`, { method: "POST" }, workingDirectory, { signal: AbortSignal.timeout(5_000) }, [200, 204, 404], false);
-    },
+    // Cancellation is drained by execute before the facade releases its writer.
+    async abortTurn() {},
   };
 }
 
@@ -92,13 +136,13 @@ function watchInteractions({ baseUrl, fetchImpl, headers, sessionId, workingDire
     settlements.set(`${type}:${requestId}`, settlement);
     void settleInteraction({ type, requestId, sessionId: interactionSessionId, request, onInteraction, onPermissionRejected, onDismiss, controller, workingDirectory, requestTurn, settlement });
   };
-  const belongsToSession = async (candidate) => {
+  const belongsToSession = async (candidate, readController = controller) => {
     const original = candidate;
     const visited = new Set();
     while (candidate && !visited.has(candidate)) {
       if (candidate === sessionId) { interactionSessionIds.add(original); return true; }
       visited.add(candidate);
-      if (!parents.has(candidate)) parents.set(candidate, requestTurn(`/session/${encodeURIComponent(candidate)}`, { method: "GET" }, workingDirectory, controller).then((session) => !session.directory || session.directory === workingDirectory ? session?.parentID : undefined));
+      if (!parents.has(candidate)) parents.set(candidate, requestTurn(`/session/${encodeURIComponent(candidate)}`, { method: "GET" }, workingDirectory, readController).then((session) => !session.directory || session.directory === workingDirectory ? session?.parentID : undefined));
       candidate = await parents.get(candidate);
     }
     return false;
@@ -176,7 +220,17 @@ function watchInteractions({ baseUrl, fetchImpl, headers, sessionId, workingDire
     if (!subscribed) readiness.reject(controller.signal.reason ?? new Error("OpenCode interaction watcher failed."));
     else if (!controller.signal.aborted) process.stderr.write("OpenCode interaction watcher failed.\n");
   });
-  return { ready: readiness.promise };
+  return {
+    ready: readiness.promise, done: watching, sessionIds: interactionSessionIds,
+    async pending(cleanup) {
+      parents.clear(); // Discard ancestry lookups cancelled with the old turn.
+      const pending = await Promise.all(["question", "permission"].map(async (type) => {
+        const requests = await requestTurn(`/${type}`, { method: "GET" }, workingDirectory, cleanup, [200], false);
+        return (await Promise.all(requests.map(async (request) => await belongsToSession(request.sessionID, cleanup) ? { type, id: request.id } : null))).filter(Boolean);
+      }));
+      return pending.flat();
+    },
+  };
 }
 
 async function settleInteraction({ type, requestId, sessionId, request: interactionRequest, onInteraction, onPermissionRejected, onDismiss, controller, workingDirectory, requestTurn, settlement }) {

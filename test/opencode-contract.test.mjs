@@ -772,10 +772,94 @@ test("U3 v2 richer forms stay native-only; external settlement releases notices,
   current.wire.assertComplete();
 });
 
+test("U4 v1 stop during admission waits for its acknowledgement before native cancellation", async (t) => {
+  const admitted = Promise.withResolvers(), acknowledge = Promise.withResolvers();
+  let admissionSignal;
+  const { executor, input, wire } = await fixture(t, "v1", { transport: async (url, init, next) => {
+    if (new URL(url).pathname.endsWith("/prompt_async")) {
+      admissionSignal = init.signal;
+      admitted.resolve();
+      await acknowledge.promise;
+    }
+    return next(url, init);
+  } });
+  const turn = executor.runTurn(input);
+  const rejected = assert.rejects(turn, /stop during admission/u);
+  await admitted.promise;
+  executor.stopAll(new Error("stop during admission"));
+  await new Promise(setImmediate);
+  assert.equal(admissionSignal.aborted, false, "An aborted HTTP request can still admit native work after an early abort");
+  assert.equal(wire.calls.some((call) => call.path.endsWith("/abort")), false);
+  acknowledge.resolve();
+  await rejected;
+  assert.equal(wire.calls.filter((call) => call.path.endsWith("/abort")).length, 1);
+  wire.assertComplete();
+});
+
+for (const late of [false, true]) test(`U4 v1 cancellation drains child requests (discovered after cancellation: ${late})`, async (t) => {
+  const admitted = Promise.withResolvers();
+  const interaction = Promise.withResolvers();
+  const acknowledge = Promise.withResolvers();
+  const current = await fixture(t, "v1", { onRequest: async (call, init) => {
+    if (late && call.path === "/session/ses_contract/abort") {
+      current.document.routes.find((route) => route.path === "/permission").responses = [{ json: [{ id: "per_contract", sessionID: "ses_child" }, { id: "per_foreign", sessionID: "ses_foreign" }] }];
+    }
+    if (call.path.endsWith("/prompt_async")) {
+      admitted.resolve();
+      await acknowledge.promise;
+    }
+  } });
+  const { executor, input, document, wire } = current;
+  const query = { directory: current.runtime.workspace };
+  document.routes.push({ method: "POST", path: "/session/ses_child/abort", query, responses: [{ json: true }] });
+  document.routes.push({ method: "POST", path: "/question/que_contract/reject", query, responses: [{ json: true }] });
+  document.routes.find((route) => route.path === "/question").responses = [{ json: [{ id: "que_contract", sessionID: "ses_contract" }] }];
+  document.routes.find((route) => route.path === "/permission").responses = [{ json: late ? [] : [{ id: "per_contract", sessionID: "ses_child" }] }];
+  document.routes.find((route) => route.path === "/session/ses_child").repeatLast = true;
+  document.routes.push({ method: "GET", path: "/session/ses_foreign", query, responses: [{ json: { id: "ses_foreign", parentID: "ses_contract", directory: path.dirname(current.runtime.workspace) } }] });
+  if (late) {
+    const event = document.routes.find((route) => route.path === "/event");
+    event.responses[0].sse = event.responses[0].sse.split("\n\n").filter((frame) => frame && !frame.includes("permission.asked")).join("\n\n") + "\n\n";
+  }
+  document.routes.find((route) => route.path === "/permission/per_contract/reply").body = { reply: "reject" };
+  const pending = executor.runTurn({ ...input, onInteraction: async (value) => {
+    if (value.sessionId === "ses_child") interaction.resolve();
+    return new Promise((_, reject) => value.signal.addEventListener("abort", () => reject(value.signal.reason), { once: true }));
+  } });
+  const rejected = assert.rejects(pending, /cancel child/u);
+  await admitted.promise;
+  if (!late) await interaction.promise;
+  await executor.abortTurn(input.sessionId, new Error("cancel child"));
+  acknowledge.resolve();
+  await rejected;
+  for (const pathname of ["/session/ses_contract/abort", "/session/ses_child/abort", "/question/que_contract/reject", "/permission/per_contract/reply"]) {
+    assert.equal(wire.calls.filter((call) => call.path === pathname).length, 1, `Missing or duplicate native cancellation: ${pathname}`);
+  }
+  await executor.ready(input.workingDirectory);
+  assert.ok(!wire.calls.some((call) => call.method === "POST" && /foreign/u.test(call.path)));
+  wire.assertComplete();
+});
+
+test("U4 v1 uncertain admission blocks replay even after native abort", async (t) => {
+  const { executor, input, wire } = await fixture(t, "v1", { transport: async (url, init, next) => {
+    const response = await next(url, init);
+    if (new URL(url).pathname.endsWith("/prompt_async")) throw new TypeError("lost acknowledgement after admission");
+    return response;
+  } });
+  await assert.rejects(executor.runTurn(input), /admission remains uncertain/u);
+  assert.equal(wire.calls.filter((call) => call.path.endsWith("/abort")).length, 1);
+  await assert.rejects(executor.ready(input.workingDirectory), /blocked/u);
+  await assert.rejects(executor.runTurn(input), /blocked/u);
+  assert.equal(wire.calls.filter((call) => call.path.endsWith("/prompt_async")).length, 1);
+  wire.assertComplete();
+});
+
 test("v1 baseline: real executor supersession aborts only the replaced thread", async (t) => {
   const admitted = Promise.withResolvers();
+  let old = false;
   const current = await fixture(t, "v1", { onRequest: async (call, init) => {
-    if (call.body?.parts?.[0]?.text !== "blocked old turn") return;
+    if (call.path.endsWith("/prompt_async")) old = call.body?.parts?.[0]?.text === "blocked old turn";
+    if (call.path !== "/session/ses_contract/message" || !old) return;
     admitted.resolve();
     await bounded(new Promise((_, reject) => {
       if (init.signal.aborted) reject(init.signal.reason);
@@ -1890,18 +1974,20 @@ test("isolated production attachment/artifact turn uses private HOME/temp and re
     } finally { executor.stopAll(); }
     const cancelledDocument = await loadWireFixture('v1', { workspace, temp: process.env.TMPDIR });
     const entered = Promise.withResolvers();
+    const acknowledge = Promise.withResolvers();
     const cancelledWire = createWireFixture(cancelledDocument, { onRequest: async (call, init) => {
       if (!call.path.endsWith('/prompt_async')) return;
       staged = new URL(call.body.parts[1].url);
       artifacts = call.body.system.match(/private artifact directory: (.+)\n/)[1];
       entered.resolve();
-      await new Promise((_, reject) => init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true }));
+      await acknowledge.promise;
     }});
     const cancelledExecutor = createOpenCodeExecutor({ baseUrl: 'http://127.0.0.1:4096', fetch: cancelledWire.fetch, artifactRoot: path.join(workspace, '.pipa', 'artifacts'), environment: process.env });
     const turn = cancelledExecutor.runTurn({ prompt: 'cancel files', sessionId: 'ses_contract', workingDirectory: workspace, contextEnvironment: { PIPA_MESSAGE_CHANNEL: 'slack' }, attachments: [{ name: 'pending.txt', fetchData: async () => Buffer.from('pending') }] });
     const rejected = assert.rejects(turn, /cancelled file turn/);
     await entered.promise;
     await cancelledExecutor.abortTurn('ses_contract', new Error('cancelled file turn'));
+    acknowledge.resolve();
     await rejected;
     await assert.rejects(access(staged), { code: 'ENOENT' });
     await assert.rejects(access(artifacts), { code: 'ENOENT' });

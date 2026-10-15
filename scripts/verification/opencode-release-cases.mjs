@@ -53,12 +53,13 @@ export const releaseCases = [
   caseOf("question-rejected-retry", "Permissions/questions", "A native rejected answer keeps editable controls until corrected submission is accepted", "U3"),
   caseOf("routine-overlap-recovery", "Routine overlap/restart recovery", "Held routine never overlaps; another proceeds; app restart retains run requests and skips missed occurrences", "U4/U6", chatCase),
   caseOf("routine-deactivate-delete", "Routine continuation/access", "Deactivation/deletion at a native execution barrier cancel engine work and suppress delivery", "U4", chatCase),
+  caseOf("shutdown-active-work", "Shutdown/delegation", "Shutdown drains root/child questions, permissions and a quiet active tool; rejects intake and preserves attached ownership", "U4", chatCase),
   caseOf("socket-detached-restart", "Detached restart, Socket", "External observer verifies full Socket CLI restart, one ready notice and follow-up", "U6/U7", { ...liveCase, modes: ["socket-owned"], blocked: "Requires actual Socket connection and live evaluator; fake Chat is not full Socket CLI restart proof" }),
   caseOf("managed-restart-startup-failure", "Detached restart, Managed/failures", "Real replacement bind failure records failure and releases owned process/lock", "U6", managedCase),
   caseOf("managed-restart-unready", "Detached restart, Managed/failures", "Real engine with invalid workspace configuration never reports replacement readiness and cleans up", "U6", managedCase),
   caseOf("delegated-child", "Native background subagents", "Actual foreground task child asks permission/question and returns one nonce to parent", "U4"),
   caseOf("background-child", "Native background subagents", "Advertised native background task returns its child nonce through production executor", "U4"),
-  caseOf("background-result-attribution", "Native background subagents", "Production result is not declared complete while a deliberately held child is unfinished", "U4"),
+  caseOf("background-result-attribution", "Native background subagents", "Preserve v1 foreground completion while background work is pending; child result returns to parent history without new Pipa delivery policy", "U4"),
   caseOf("models-switch", "Models/providers", "Production model discovery/switch seam retains history and changes the next provider request", "U5", { native: true, generations: ["2"] }),
   ...["variants", "default", "reset"].map((kind) => caseOf(`models-${kind}`, "Models/providers", `Native ${kind} semantics preserve history and prove the next provider request`, "U5", { blocked: `No qualified public production ${kind} seam/request contract; model switching alone does not prove ${kind} semantics (U5)` })),
   caseOf("definitions-mcp-skill", "MCP/skills/agents/commands/plugins", "Invoke real stdio MCP and file skill through actual native tools; plugin loads", "U7"),
@@ -281,7 +282,6 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
   let eventConnections = 0;
   let disconnectEvents = false;
   let migrationJourney;
-  let backgroundProbe;
   let routineScheduler;
   const nonce = randomUUID().replaceAll("-", "");
   cell.evidence.nonce = nonce;
@@ -308,12 +308,6 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
     const eventConnection = disconnectEvents && new URL(address).pathname.endsWith("/event") ? new AbortController() : null;
     const signal = init.signal ?? request?.signal;
     const response = await fetch(url, eventConnection ? { ...init, signal: AbortSignal.any([eventConnection.signal, ...(signal ? [signal] : [])]) } : init);
-    if (backgroundProbe?.sessionId && address.includes(backgroundProbe.sessionId) && new URL(address).pathname.includes("message") && response.ok) {
-      const body = await response.clone().json().catch(() => null);
-      const messages = Array.isArray(body) ? body : body?.data;
-      if (Array.isArray(messages) && JSON.stringify(messages).includes(textFor("background-parent") + ":child-pending")
-        && messages.some((message) => message.info?.time?.completed || message.type === "idle")) backgroundProbe.partialPolls++;
-    }
     if (eventConnection && response.headers.get("content-type")?.includes("text/event-stream")) {
       eventConnections++;
       eventAbort = eventConnection;
@@ -354,6 +348,8 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
     }, { timeoutMs: 15_000, label: "native listening URL" });
   };
   const startApp = async (serverOverride) => {
+    // Targeted case selection must not depend on package-cli having saved config.
+    await state.writePrivateJson(paths.config, config);
     app = await appModule.startPipa({ config, paths, chat, checkSlackToken: async () => ({ ok: true }), startupTimeoutMs: 20000, shutdownTimeoutMs: 5000, routineIntervalMs: 100,
       createRoutineScheduler: (options) => { routineScheduler = routines.createRoutineScheduler(options); return routineScheduler; },
       createExecutor: makeExecutor,
@@ -639,9 +635,7 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
       const child = promptFor("background-child");
       provider.register({ prompt: child, text: textFor("background-child"), hold: true });
       const completed = (messages) => JSON.stringify(messages).includes(textFor("background-child"));
-      backgroundProbe = { partialPolls: 0, settled: false };
-      const probe = backgroundProbe;
-      const pending = turn("background-parent", { onSession: (id) => { probe.sessionId = id; } }, {
+      const pending = turn("background-parent", {}, {
         maxCalls: 6, toolOnce: true,
         // Native background completion may add a new user projection. Accept only
         // this parent's unique history plus this child's actual result marker.
@@ -649,15 +643,12 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
         text: (messages) => `${textFor("background-parent")}:${completed(messages) ? "child-complete" : "child-pending"}`,
         tool: { names: [tool.name], arguments: () => ({ description: "Run actual synthetic background child", prompt: child, ...(tool.name === "task" ? { subagent_type: "matrix-fixture" } : { agent: "matrix-fixture" }), [background]: true }) },
       });
-      void pending.then(() => { probe.settled = true; }, () => { probe.settled = true; });
       try {
         await runtime.waitFor(() => provider.receipts.some((receipt) => receipt.prompt === child), { timeoutMs: 5000, label: "actual held background inference" });
-        // Completion or a subsequent authoritative poll decides the barrier,
-        // not a sleep/race between fast child inference and parent delivery.
-        await runtime.waitFor(() => probe.settled || probe.partialPolls >= 2, { timeoutMs: 5000, label: "parent completion or continued reconciliation" });
-        const completedBeforeChild = probe.settled;
-        provider.release(child);
+        // Characterized v1 behavior: the foreground result returns while a native
+        // background child remains held. Pipa does not invent late-result delivery.
         const result = await pending;
+        provider.release(child);
         const admission = inputReceipt(promptFor("background-parent"));
         // Derive the native read namespace from the actual facade admission,
         // never from a forced adapter or requested engine generation.
@@ -673,17 +664,15 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
         }, { timeoutMs: 5000, label: "authoritative parent projection contains background child result" });
         const drained = await turn("background-drain", { sessionId: result.sessionId }, { verify: (messages) => assert.ok(completed(messages), "Native background result never returned to parent history") });
         assertTurnOutcome(drained, { sessionId: result.sessionId, text: textFor("background-drain") });
-        cell.evidence.background = { selector: background, publicResult: result.text, completedBeforeChild, childProviderObserved: true, parentSession: result.sessionId, drainRetainedChildHistory: true };
+        cell.evidence.background = { selector: background, publicResult: result.text, childProviderObserved: true, parentSession: result.sessionId, drainRetainedChildHistory: true };
       } finally {
-        backgroundProbe = null;
         if (provider.receipts.some((receipt) => receipt.prompt === child)) provider.release(child);
         await pending.catch(() => undefined);
       }
     },
     "background-result-attribution": async () => {
       if (!cell.evidence.background) return { status: "BLOCKED", observed: "Native background case did not reach its held-child barrier and result observation" };
-      assert.equal(cell.evidence.background.completedBeforeChild, false, "Production executor returned a completed result while native background child was still held");
-      assert.equal(cell.evidence.background.publicResult, `${textFor("background-parent")}:child-complete`);
+      assert.equal(cell.evidence.background.publicResult, `${textFor("background-parent")}:child-pending`);
     },
     "definitions-mcp-skill": async () => {
       if (requireExecutor()) return requireExecutor();
@@ -984,6 +973,62 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
         const saved = (await routines.loadRoutineState(paths.routines)).routines.find((item) => item.id === id);
         if (operation === "delete") assert.equal(saved, undefined);
         else { assert.equal(saved.status, "inactive"); await routines.deleteRoutine(id, paths); }
+      }
+    },
+    "shutdown-active-work": async () => {
+      if (requireApp()) return requireApp();
+      for (const [index, kind] of ["root-question", "child-question", "child-permission", "quiet-tool", "child-quiet-tool"].entries()) {
+        const id = `shutdown-${kind}`;
+        const thread = `slack:CMATRIX:630.${index + 1}`;
+        const child = promptFor(`${id}-child`);
+        const marker = path.join(runtime.workspace, `${id}.pid`);
+        const question = { names: ["question", "form"], arguments: (_, tool) => tool.name === "question"
+          ? { questions: [{ header: "Shutdown", question: "Wait for cancellation", options: [{ label: "Yes", description: "Continue" }] }] }
+          : { title: "Shutdown", fields: [{ key: "q0", type: "string", options: [{ value: "Yes", label: "Yes" }], required: true }] } };
+        const tool = { names: ["bash", "shell", "$shell"], arguments: () => ({ command: `"${process.execPath}" -e 'require("node:fs").writeFileSync(${JSON.stringify(marker)},String(process.pid));setInterval(()=>{},1000)'`, description: "Quiet tool held until native cancellation" }) };
+        if (kind.startsWith("child-")) provider.register({ prompt: child, text: textFor(id), tool: kind === "child-question" ? question : tool });
+        provider.register({ prompt: promptFor(id), text: textFor(id), tool: kind.startsWith("child-")
+          ? { names: ["task", "subagent"], arguments: (_, tool) => ({ description: "Held child for shutdown", prompt: child, ...(tool.name === "task" ? { subagent_type: "matrix-fixture" } : { agent: "matrix-fixture" }) }) }
+          : kind === "quiet-tool" ? tool : question });
+        const message = chat.send(thread, promptFor(id));
+        const control = await runtime.waitFor(() => chat.controls.findLast((item) => item.thread === thread), { timeoutMs: 12000, label: `${kind} pending control` });
+        let toolPid;
+        if (kind.endsWith("quiet-tool")) {
+          const action = control.blocks.flatMap((block) => block.elements ?? []).find((item) => item.action_id?.startsWith("pipa_permission_once_"));
+          assert.ok(action);
+          await chat.handlers.action({ actionId: action.action_id, value: action.value, threadId: thread, user: { userId: "UMATRIX" } });
+          toolPid = await runtime.waitFor(() => readFile(marker, "utf8").then(Number, (error) => { if (error.code !== "ENOENT") throw error; return false; }), { timeoutMs: 5000, label: "quiet tool started" });
+          assert.equal(state.isRunning(toolPid), true);
+          // A completed native tool, not a short production deadline, ends work.
+          assert.ok(!chat.posts.some((item) => item.thread === thread));
+        }
+        const previousAdmissions = wires.filter((wire) => isNativeAdmission(wire, "intake after shutdown")).length;
+        await app.shutdown();
+        assert.ok(control.deleted || control.updated?.blocks?.every((block) => block.type !== "actions"), `${kind} retained live controls`);
+        assert.ok(!chat.posts.some((item) => item.thread === thread && item.content?.markdown === textFor(id)));
+        assert.ok(!chat.reactions.some((item) => item.message === message.id && item.added && item.emoji === "white_check_mark"));
+        chat.send(thread, "intake after shutdown");
+        await new Promise(setImmediate);
+        assertNativeAdmissionCount(wires, "intake after shutdown", previousAdmissions);
+        if (toolPid) await runtime.waitFor(() => !state.isRunning(toolPid), { timeoutMs: 5000, label: "quiet native tool process exit" });
+        if (mode === "attached") {
+          await health();
+          const read = async (pathname, query = {}) => {
+            const url = new URL(`${baseUrl}${pathname}`);
+            for (const [key, value] of Object.entries(query)) url.searchParams.set(key, value);
+            const response = await fetch(url, { headers, signal: AbortSignal.timeout(1000) });
+            assert.equal(response.status, 200);
+            return response.json();
+          };
+          if (pin.startsWith("2.")) {
+            for (const pathname of ["/api/form", "/api/permission/request"]) assert.deepEqual((await read(pathname, { "location[directory]": runtime.workspace })).data, []);
+            assert.deepEqual((await read("/api/session/active")).data, {});
+          } else {
+            for (const pathname of ["/question", "/permission"]) assert.deepEqual(await read(pathname, { directory: runtime.workspace }), []);
+            assert.ok(Object.values(await read("/session/status", { directory: runtime.workspace })).every((item) => !["busy", "retry"].includes(item.type)));
+          }
+        }
+        await startApp();
       }
     },
     "managed-restart-startup-failure": () => managedFailure("bind"),
