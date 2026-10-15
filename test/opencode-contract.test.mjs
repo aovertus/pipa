@@ -4,7 +4,7 @@ import { access, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { createConversationRunner, startPipa } from "../src/app.mjs";
+import { createConversationRunner, createPendingInteractions, startPipa } from "../src/app.mjs";
 import { cleanChildEnvironment, createOpenCodeExecutor, startSocketOpenCodeServer } from "../src/opencode.mjs";
 import { acquireInstanceLock, createSessionStore, pipaPaths } from "../src/state.mjs";
 import { bounded, createRuntimeFixture, waitFor } from "./helpers/runtime-fixture.mjs";
@@ -156,6 +156,620 @@ test("v1 baseline: subscription, duplicate question suppression and linked child
   ]);
   assert.ok(wire.calls.findIndex((call) => call.path === "/event") < wire.calls.findIndex((call) => call.path.endsWith("/prompt_async")));
   wire.assertComplete();
+});
+
+test("v2 native questions and child permissions expose acceptance without duplicate legacy submission", async (t) => {
+  const replies = [];
+  const current = await fixture(t, "v2", { onRequest: async (call) => {
+    if (call.path.endsWith("/reply")) replies.push(call);
+    if (call.path.endsWith("/prompt")) await waitFor(() => replies.length === 2, { label: "native interaction replies" });
+  } });
+  const { document, runtime, executor, input, wire } = current;
+  const form = { id: "frm_contract", sessionID: "ses_contract", title: "Color", metadata: { kind: "question" }, fields: [{ key: "q0", type: "string", title: "Pick one", required: true, options: [{ value: "Blue", label: "Blue" }] }] };
+  const permission = { id: "per_contract", sessionID: "ses_child", action: "bash", resources: ["pwd"] };
+  for (const [route, json] of [
+    ["/api/form", { location: { directory: runtime.workspace }, data: [form] }],
+    ["/api/permission/request", { location: { directory: runtime.workspace }, data: [permission] }],
+    ["/api/session/ses_child/permission", { data: [permission] }],
+    ["/api/session/ses_contract/form/frm_contract", { data: { ...form, state: { status: "pending" } } }],
+    ["/api/session/ses_child", { data: { id: "ses_child", parentID: "ses_contract", location: { directory: runtime.workspace } } }],
+  ]) document.routes.push({ method: "GET", path: route, ...(["/api/form", "/api/permission/request"].includes(route) ? { query: { "location[directory]": runtime.workspace } } : {}), repeatLast: true, responses: [{ json }] });
+  const seen = [];
+  await runTurnContract({ executor, input: { ...input, onInteraction: async (interaction) => {
+    seen.push([interaction.type, interaction.sessionId]);
+    assert.equal(typeof interaction.submit, "function");
+    const decision = interaction.type === "question" ? { type: "answer", answers: [["Blue"]] } : { type: "reply", reply: "once" };
+    await interaction.submit(decision);
+    return decision;
+  } }, expected: document.expected });
+  assert.deepEqual(seen.sort(), [["permission", "ses_child"], ["question", "ses_contract"]]);
+  assert.equal(replies.length, 2);
+  wire.assertComplete();
+});
+
+async function nativeInteractions(t, { forms = [], permissions = [], onReply, onPrompt, transport, executorOptions } = {}) {
+  const pendingForms = [...forms], pendingPermissions = [...permissions];
+  const calls = [];
+  const current = await fixture(t, "v2", {
+    transport,
+    executorOptions,
+    onRequest: async (call) => {
+      if (call.path.endsWith("/prompt")) await onPrompt?.();
+      if (call.path.endsWith("/reply") || (call.method === "DELETE" && call.path.includes("/form/"))) {
+        calls.push(call);
+        await onReply?.(call, pendingForms, pendingPermissions);
+      }
+    },
+  });
+  const { document, runtime } = current;
+  // Keep the original completion event; discovery comes from native pending reads.
+  document.routes.find((route) => route.path === "/api/event").responses[0].sse = document.routes.find((route) => route.path === "/api/event").responses[0].sse.split("\n\n").filter((frame) => frame.includes("evt_done")).join("\n\n") + "\n\n";
+  for (const [route, json, query] of [
+    ["/api/form", { location: { directory: runtime.workspace }, data: pendingForms }, { "location[directory]": runtime.workspace }],
+    ["/api/permission/request", { location: { directory: runtime.workspace }, data: pendingPermissions }, { "location[directory]": runtime.workspace }],
+    ["/api/session/ses_child", { data: { id: "ses_child", parentID: "ses_contract", location: { directory: runtime.workspace } } }],
+    ["/api/session/ses_unrelated", { data: { id: "ses_unrelated", location: { directory: runtime.workspace } } }],
+    ["/api/session/ses_child/message/msg_tool", { data: { id: "msg_tool", type: "assistant", time: { created: 2 }, content: [{ type: "tool", id: "call_native", name: "bash", time: { created: 2 }, state: { status: "running", input: { command: "pwd" }, metadata: {} } }] } }],
+    ["/api/session/ses_wrong_location", { data: { id: "ses_wrong_location", parentID: "ses_contract", location: { directory: path.dirname(runtime.workspace) } } }],
+  ]) document.routes.push({ method: "GET", path: route, ...(query ? { query } : {}), repeatLast: true, responses: [{ json }] });
+  for (const form of forms) {
+    document.routes.push({ method: "GET", path: `/api/session/${form.sessionID}/form/${form.id}`, repeatLast: true, responses: [{ json: { data: { ...form, state: { status: "pending" } } } }] });
+    document.routes.push({ method: "POST", path: `/api/session/${form.sessionID}/form/${form.id}/reply`, repeatLast: true, responses: [{ status: 204 }] });
+    document.routes.push({ method: "DELETE", path: `/api/session/${form.sessionID}/form/${form.id}`, repeatLast: true, responses: [{ status: 204 }] });
+  }
+  for (const id of new Set(permissions.map((item) => item.sessionID))) document.routes.push({ method: "GET", path: `/api/session/${id}/permission`, repeatLast: true, responses: [{ json: { data: pendingPermissions } }] });
+  for (const permission of permissions) document.routes.push({ method: "POST", path: `/api/session/${permission.sessionID}/permission/${permission.id}/reply`, repeatLast: true, responses: [{ status: 204 }] });
+  return { ...current, pendingForms, pendingPermissions, calls };
+}
+
+const nativeExamples = JSON.parse(await readFile(new URL("./fixtures/opencode/v2/interactions.json", import.meta.url), "utf8"));
+
+for (const settlementEvent of ["question.replied", "question.rejected"]) test(`U3 v1 external question settlement observed during an uncertain pending read survives its stale snapshot: ${settlementEvent}`, async (t) => {
+  const staleRead = Promise.withResolvers(), releaseRead = Promise.withResolvers(), nextObserved = Promise.withResolvers(), finished = Promise.withResolvers();
+  const question = { id: "que_contract", sessionID: "ses_contract", questions: [{ question: "Pick", options: [{ label: "Blue" }] }] };
+  const next = { ...question, id: "que_next" };
+  let stream, questionReads = 0;
+  const current = await fixture(t, "v1", {
+    onRequest: async (call) => { if (call.path.endsWith("/prompt_async")) await finished.promise; },
+    transport: async (url, init, fetch) => {
+      const pathname = new URL(url).pathname;
+      if (pathname === "/event") return new Response(new ReadableStream({ start(controller) {
+        stream = controller;
+        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: "question.asked", properties: question })}\n\n`));
+        init.signal.addEventListener("abort", () => { try { controller.close(); } catch {} }, { once: true });
+      } }), { headers: { "content-type": "text/event-stream" } });
+      if (pathname === "/question/que_contract/reply") { await fetch(url, init); throw new TypeError("lost native reply"); }
+      if (pathname === "/question" && ++questionReads === 2) {
+        staleRead.resolve();
+        await releaseRead.promise;
+        return new Response(JSON.stringify([question]), { headers: { "content-type": "application/json" } });
+      }
+      return fetch(url, init);
+    },
+  });
+  current.document.routes.push({ method: "POST", path: "/question/que_next/reply", query: { directory: current.runtime.workspace }, body: { answers: [["Blue"]] }, responses: [{ json: true }] });
+  const posted = [], deleted = [];
+  const thread = { id: "slack:C1:1.0", adapter: { webClient: { chat: {
+    postMessage: async (value) => { posted.push(value); return { ts: String(posted.length) }; }, update: async () => {}, delete: async (value) => deleted.push(value),
+  } } } };
+  const controls = createPendingInteractions();
+  const decisions = [];
+  const turn = current.executor.runTurn({ ...current.input, onInteraction: (interaction) => {
+    if (interaction.request.id === next.id) nextObserved.resolve();
+    const decision = controls.onInteraction({ thread }, interaction);
+    void decision.catch(() => undefined);
+    decisions.push(decision);
+    return decision;
+  } });
+  const answer = async (card) => {
+    const elements = card.blocks.flatMap((block) => block.elements ?? []);
+    const select = elements.find((item) => item.action_id.startsWith("pipa_select_"));
+    const submit = elements.find((item) => item.action_id.startsWith("pipa_submit_"));
+    const click = (item, value = item.value) => controls.onAction({ threadId: thread.id, user: { userId: "U1" }, actionId: item.action_id, value });
+    await click(select, select.options[0].value);
+    await click(submit);
+  };
+  try {
+    await waitFor(() => posted.length === 1);
+    const click = answer(posted[0]);
+    await bounded(staleRead.promise, { signal: current.runtime.signal });
+    for (const event of [{ type: settlementEvent, properties: { sessionID: question.sessionID, requestID: question.id, ...(settlementEvent === "question.replied" ? { answers: [["Blue"]] } : {}) } }, { type: "question.asked", properties: next }]) stream.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
+    await bounded(nextObserved.promise, { signal: current.runtime.signal });
+    releaseRead.resolve();
+    await click;
+    assert.deepEqual(await bounded(decisions[0], { timeoutMs: 100, label: "external settlement releases first card" }), { type: "cancelled" });
+    await waitFor(() => posted.length === 2);
+    assert.equal(deleted.length, 1);
+    await answer(posted[1]);
+    finished.resolve();
+    assertTurnOutcome(await turn, current.document.expected);
+    assert.equal(current.wire.calls.filter((call) => call.path === "/question/que_contract/reply").length, 1);
+    current.wire.assertComplete();
+  } finally { releaseRead.resolve(); finished.resolve(); await turn.catch(() => undefined); }
+});
+
+test("U3 v1 optional permission hydration 503 followed by reconnect registers one usable control", async (t) => {
+  const failedHydration = Promise.withResolvers(), allow = Promise.withResolvers(), finished = Promise.withResolvers();
+  const permission = { id: "per_hydrate", sessionID: "ses_contract", permission: "bash", patterns: ["pwd"], tool: { messageID: "msg_hydrate", callID: "call_hydrate" } };
+  let stream, streams = 0, hydrationReads = 0;
+  const current = await fixture(t, "v1", {
+    onRequest: async (call) => {
+      if (call.path.endsWith("/prompt_async")) await finished.promise;
+      if (call.path.endsWith("per_hydrate/reply")) finished.resolve();
+    },
+    transport: async (url, init, fetch) => {
+      const parsed = new URL(url);
+      if (parsed.pathname === "/event") {
+        streams++;
+        return new Response(new ReadableStream({ start(controller) {
+          stream = controller;
+          if (streams === 1) controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: "permission.asked", properties: permission })}\n\n`));
+          init.signal.addEventListener("abort", () => { try { controller.close(); } catch {} }, { once: true });
+        } }), { headers: { "content-type": "text/event-stream" } });
+      }
+      if (parsed.pathname === "/permission" && hydrationReads > 0) return new Response(JSON.stringify([permission]), { headers: { "content-type": "application/json" } });
+      if (parsed.pathname.endsWith("/message") && parsed.searchParams.get("limit") === "100" && ++hydrationReads === 1) {
+        failedHydration.resolve();
+        return new Response("unavailable", { status: 503 });
+      }
+      return fetch(url, init);
+    },
+  });
+  current.document.routes.push({ method: "GET", path: "/session/ses_contract/message", query: { directory: current.runtime.workspace, limit: "100" }, responses: [{ json: [{ info: { id: "msg_hydrate", role: "assistant" }, parts: [{ type: "tool", callID: "call_hydrate", tool: "bash", state: { input: { command: "pwd" } } }] }] }] });
+  current.document.routes.push({ method: "POST", path: "/permission/per_hydrate/reply", query: { directory: current.runtime.workspace }, body: { reply: "once" }, responses: [{ json: true }] });
+  const seen = [];
+  const turn = current.executor.runTurn({ ...current.input, onInteraction: async (interaction) => { seen.push(interaction); await allow.promise; return { type: "reply", reply: "once" }; } });
+  try {
+    await bounded(failedHydration.promise, { signal: current.runtime.signal });
+    stream.close();
+    await waitFor(() => streams === 2);
+    assert.equal(seen.length, 1, "a failed optional detail read must not permanently deduplicate the permission");
+    assert.equal(typeof seen[0].submit, "function");
+    assert.equal(seen[0].request.permission, "bash");
+    allow.resolve();
+    assertTurnOutcome(await turn, current.document.expected);
+    assert.equal(seen.length, 1);
+    assert.equal(current.wire.calls.filter((call) => call.path.endsWith("per_hydrate/reply")).length, 1);
+    current.wire.assertComplete();
+  } finally { allow.resolve(); finished.resolve(); await turn.catch(() => undefined); }
+});
+
+for (const responseKind of ["delayed", "lost", "timeout"]) for (const kind of ["question", "permission reject"]) test(`U3 v2 terminal projection waits for a ${responseKind} local ${kind} acknowledgement before settling its card`, async (t) => {
+  const acknowledgement = Promise.withResolvers(), terminalRead = Promise.withResolvers();
+  const form = { ...nativeExamples.question, sessionID: "ses_contract", fields: [nativeExamples.question.fields[0]] };
+  let applied = false, terminal, acknowledgementLost = false, reconciled = 0;
+  const current = await nativeInteractions(t, {
+    executorOptions: { connectionRequestTimeoutMs: responseKind === "timeout" ? 200 : 2000 },
+    forms: kind === "question" ? [form] : [], permissions: kind === "question" ? [] : [nativeExamples.permission],
+    onReply: (_, forms, permissions) => {
+      forms.splice(0); permissions.splice(0);
+      const messages = current.document.routes.find((route) => route.path.endsWith("/message"));
+      messages.responses[messages.responses.length - 1] = terminal;
+      if (kind === "question") current.document.routes.find((route) => route.method === "GET" && route.path.endsWith(form.id)).responses[0].json.data.state = { status: "answered", answer: { q0: "blue-id" } };
+      applied = true;
+    },
+    transport: async (url, init, fetch) => {
+      const response = await fetch(url, init);
+      const pathname = new URL(url).pathname;
+      if (pathname.endsWith("/reply")) {
+        try {
+          await bounded(acknowledgement.promise, { signal: init.signal });
+          if (responseKind === "lost") throw new TypeError("lost native acknowledgement");
+        } catch (error) { acknowledgementLost = true; throw error; }
+      }
+      if (acknowledgementLost && init.method === "GET" && (pathname === `/api/session/ses_contract/form/${form.id}` || pathname === "/api/session/ses_child/permission")) reconciled++;
+      if (applied && new URL(url).pathname === "/api/session/ses_contract/message") {
+        const journal = JSON.parse(await readFile(pipaPaths(current.runtime.home).openCodeRecovery, "utf8"));
+        if (journal.records[0]?.phase === "admitted") terminalRead.resolve();
+      }
+      return response;
+    },
+  });
+  const messages = current.document.routes.find((route) => route.path.endsWith("/message"));
+  terminal = structuredClone(messages.responses.at(-1));
+  if (kind !== "question") terminal.json.data.find((message) => message.type === "assistant").content = [];
+  messages.responses[messages.responses.length - 1] = { json: { data: [terminal.json.data[0]], cursor: { previous: null, next: null } } };
+  const posted = [], updated = [], deleted = [];
+  const thread = { id: "slack:C1:1.0", adapter: { webClient: { chat: {
+    postMessage: async (value) => { posted.push(value); return { ts: "2.0" }; }, update: async (value) => updated.push(value), delete: async (value) => deleted.push(value),
+  } } } };
+  const controls = createPendingInteractions();
+  let external = false;
+  const turn = current.executor.runTurn({ ...current.input, onInteraction: (interaction) => {
+    interaction.settled.then(() => { external = true; });
+    return controls.onInteraction({ thread }, interaction);
+  } });
+  void turn.catch(() => undefined);
+  try {
+    await waitFor(() => posted.length === 1);
+    const elements = posted[0].blocks.flatMap((block) => block.elements ?? []);
+    const click = (item, value = item.value) => controls.onAction({ threadId: thread.id, user: { userId: "U1" }, actionId: item.action_id, value });
+    if (kind === "question") { const select = elements.find((item) => item.action_id.startsWith("pipa_select_")); await click(select, select.options[0].value); }
+    const sending = click(elements.find((item) => item.action_id.startsWith(kind === "question" ? "pipa_submit_" : "pipa_permission_reject_")));
+    await bounded(terminalRead.promise, { signal: current.runtime.signal });
+    // Drain runnable continuations after the terminal read; the HTTP acknowledgement
+    // barrier is still closed. No callback/completion gate conceals the race.
+    await new Promise(setImmediate);
+    if (responseKind !== "timeout") {
+      assert.equal(external, false, "in-flight local acceptance must not be labelled external by finalization");
+      assert.deepEqual(deleted, []);
+      acknowledgement.resolve();
+    }
+    await bounded(sending, { timeoutMs: 1000, label: "bounded native acknowledgement/reconciliation" });
+    if (responseKind !== "delayed" && kind !== "question") await assert.rejects(turn, /without assistant text/u);
+    else assertTurnOutcome(await turn, { ...current.document.expected, ...(kind !== "question" ? { text: "Stopped after a permission was rejected." } : {}) });
+    if (responseKind === "delayed") {
+      assert.equal(external, false);
+      assert.deepEqual(deleted, []);
+      assert.match(JSON.stringify(updated.at(-1)), kind === "question" ? /Selected/u : /Permission rejected/u);
+    } else {
+      assert.equal(acknowledgementLost, true);
+      assert.ok(reconciled > 0, "missing acknowledgement requires a native pending-state read before settlement");
+      assert.equal(external, true, "absence alone cannot attribute acceptance to the local decision");
+      assert.equal(deleted.length, 1);
+    }
+    assert.equal(current.calls.length, 1);
+    current.wire.assertComplete();
+  } finally { acknowledgement.resolve(); await turn.catch(() => undefined); }
+});
+
+test("U3 v1 acknowledgement preserves positional arrays and retries rejection without duplicate native submission", async (t) => {
+  const finished = Promise.withResolvers();
+  const current = await fixture(t, "v1", { onRequest: async (call) => { if (call.path.endsWith("/prompt_async")) await finished.promise; } });
+  const reply = current.document.routes.find((route) => route.path === "/question/que_contract/reply");
+  reply.responses.unshift({ status: 400, json: { error: "Invalid answer" } });
+  let retried = false;
+  const result = await current.executor.runTurn({ ...current.input, onInteraction: async (interaction) => {
+    if (interaction.type === "permission") return { type: "reply", reply: "once" };
+    try {
+      await assert.rejects(interaction.submit({ type: "answer", answers: [["Blue"]] }), /400/u);
+      await interaction.submit({ type: "answer", answers: [["Blue"]] });
+      retried = true;
+      return { type: "answer", answers: [["Blue"]] };
+    } finally { finished.resolve(); }
+  } });
+  assertTurnOutcome(result, current.document.expected);
+  assert.equal(retried, true);
+  assert.deepEqual(current.wire.calls.filter((call) => call.path === reply.path).map((call) => call.body), [{ answers: [["Blue"]] }, { answers: [["Blue"]] }]);
+  current.wire.assertComplete();
+});
+
+test("U3 v1 reconnect reconciles externally settled questions without submitting a stale callback", async (t) => {
+  const disconnected = Promise.withResolvers(), done = Promise.withResolvers();
+  let streams = 0, stream;
+  const current = await fixture(t, "v1", {
+    onRequest: async (call) => { if (call.path.endsWith("/prompt_async")) await done.promise; },
+    transport: async (url, init, fetch) => {
+      if (new URL(url).pathname !== "/event") return fetch(url, init);
+      streams++;
+      if (streams === 2) disconnected.resolve();
+      return new Response(new ReadableStream({ start(controller) { stream = controller; init.signal.addEventListener("abort", () => { try { controller.close(); } catch {} }, { once: true }); } }), { headers: { "content-type": "text/event-stream" } });
+    },
+  });
+  const route = current.document.routes.find((route) => route.path === "/question");
+  const question = { id: "que_contract", sessionID: "ses_contract", questions: [{ question: "Pick", options: [{ label: "Blue" }] }] };
+  route.responses = [{ json: [question] }, { json: [question] }, { json: [] }];
+  const observed = Promise.withResolvers();
+  let callbacks = 0, settled = false;
+  const turn = current.executor.runTurn({ ...current.input, onInteraction: async (interaction) => {
+    callbacks++;
+    observed.resolve();
+    await interaction.settled;
+    settled = true;
+    done.resolve();
+    return { type: "answer", answers: [["Blue"]] };
+  } });
+  await observed.promise;
+  stream.close();
+  await disconnected.promise;
+  assertTurnOutcome(await turn, current.document.expected);
+  assert.equal(settled, true);
+  assert.equal(callbacks, 1);
+  assert.equal(current.wire.calls.some((call) => call.path.endsWith("/reply")), false);
+  current.wire.assertComplete();
+});
+
+test("U3 v1 lost question reply reconciles native absence and suppresses a legacy return decision", async (t) => {
+  const done = Promise.withResolvers();
+  let lost = false;
+  const current = await fixture(t, "v1", {
+    onRequest: async (call) => { if (call.path.endsWith("/prompt_async")) await done.promise; },
+    transport: async (url, init, fetch) => {
+      const result = await fetch(url, init);
+      if (new URL(url).pathname === "/question/que_contract/reply" && !lost) { lost = true; throw new TypeError("lost response"); }
+      return result;
+    },
+  });
+  let reconciled = false;
+  const result = await current.executor.runTurn({ ...current.input, onInteraction: async (interaction) => {
+    if (interaction.type === "permission") return { type: "reply", reply: "once" };
+    try {
+      await interaction.submit({ type: "answer", answers: [["Blue"]] });
+      await interaction.settled;
+      await assert.rejects(interaction.submit({ type: "answer", answers: [["Blue"]] }), /settled/u);
+      reconciled = true;
+      return { type: "answer", answers: [["Blue"]] };
+    } finally { done.resolve(); }
+  } });
+  assertTurnOutcome(result, current.document.expected);
+  assert.equal(reconciled, true);
+  assert.equal(current.wire.calls.filter((call) => call.path === "/question/que_contract/reply").length, 1);
+  current.wire.assertComplete();
+});
+
+test("U3 v2 lost keyed-form reply reads native answered state before making the stale response inert", async (t) => {
+  const done = Promise.withResolvers();
+  let lost = false;
+  const current = await nativeInteractions(t, { forms: [nativeExamples.question], onPrompt: () => done.promise,
+    transport: async (url, init, fetch) => {
+      const response = await fetch(url, init);
+      if (new URL(url).pathname.endsWith("frm_native/reply") && !lost) {
+        lost = true;
+        current.pendingForms.splice(0);
+        const detail = current.document.routes.find((route) => route.method === "GET" && route.path.endsWith("frm_native"));
+        detail.responses[0].json.data.state = { status: "answered", answer: { q0: "blue-id", q1: ["fast-id"], q2: "name" } };
+        throw new TypeError("lost response");
+      }
+      return response;
+    },
+  });
+  let reconciled = false;
+  const result = await current.executor.runTurn({ ...current.input, onInteraction: async (interaction) => {
+    try {
+      await interaction.submit({ type: "answer", answers: [["Blue"], ["Fast"], ["name"]] });
+      await interaction.settled;
+      await assert.rejects(interaction.submit({ type: "answer", answers: [["Red"], ["Small"], ["other"]] }), /settled/u);
+      reconciled = true;
+      return { type: "answer", answers: [["Blue"], ["Fast"], ["name"]] };
+    } finally { done.resolve(); }
+  } });
+  assertTurnOutcome(result, current.document.expected);
+  assert.equal(reconciled, true);
+  assert.equal(current.calls.length, 1);
+  assert.equal(current.wire.calls.filter((call) => call.method === "GET" && call.path.endsWith("frm_native")).length, 2);
+  current.wire.assertComplete();
+});
+
+test("U3 v2 dismissal cancels the child form and interrupts only its session", async (t) => {
+  const done = Promise.withResolvers();
+  const current = await nativeInteractions(t, { forms: [nativeExamples.question], onPrompt: () => done.promise });
+  current.document.routes.push({ method: "POST", path: "/api/session/ses_child/interrupt", query: { resume: "false" }, responses: [{ json: { interrupted: true } }] });
+  let submitted = false;
+  const result = await current.executor.runTurn({ ...current.input, onInteraction: async (interaction) => {
+    try { await interaction.submit({ type: "stop" }); submitted = true; return { type: "stop" }; }
+    finally { done.resolve(); }
+  } });
+  assert.equal(result.text, "");
+  assert.equal(submitted, true);
+  assert.deepEqual(current.calls.map((call) => [call.method, call.path]), [["DELETE", "/api/session/ses_child/form/frm_native"]]);
+  assert.equal(current.wire.calls.filter((call) => call.path.endsWith("/interrupt")).length, 1);
+  current.wire.assertComplete();
+});
+
+for (const confirmation of ["complete", "wrong tool", "still active", "form pending"]) test(`U3 native root dismissal without idle requires exact native confirmation: ${confirmation}`, async (t) => {
+  const done = Promise.withResolvers();
+  const form = { ...nativeExamples.question, sessionID: "ses_contract", metadata: { kind: "question", tool: { messageID: "msg_aborted", id: "call_question" } } };
+  const current = await nativeInteractions(t, { forms: [form], executorOptions: { cleanupTimeoutMs: 100 }, onPrompt: () => done.promise,
+    onReply: async () => {
+      const journal = JSON.parse(await readFile(pipaPaths(current.runtime.home).openCodeRecovery, "utf8"));
+      assert.deepEqual(journal.records[0].dismissal, { formId: form.id, messageId: "msg_aborted", toolId: "call_question" }, "dismissal intent must be durable before native cancellation");
+      const detail = current.document.routes.find((route) => route.method === "GET" && route.path.endsWith("frm_native"));
+      detail.responses[0].json.data.state = { status: confirmation === "form pending" ? "pending" : "cancelled" };
+      if (confirmation === "still active") current.document.routes.find((route) => route.path === "/api/session/active").responses[0].json.data = { ses_contract: { type: "running" } };
+      current.pendingForms.splice(0);
+    },
+  });
+  const messages = current.document.routes.find((route) => route.path.endsWith("/message"));
+  messages.responses.at(-1).json.data = [messages.responses.at(-1).json.data[0], {
+    id: "msg_aborted", type: "assistant", time: { created: 3, completed: 4 }, finish: "error", error: { type: "aborted", message: "Step interrupted" },
+    content: [{ type: "tool", id: confirmation === "wrong tool" ? "other_tool" : "call_question", name: "question", time: { created: 3, completed: 4 },
+      state: { status: "error", input: {}, error: { type: "aborted", message: "The user dismissed this question" } } }],
+  }];
+  current.document.routes.push({ method: "POST", path: "/api/session/ses_contract/interrupt", query: { resume: "false" }, repeatLast: true, responses: [{ json: { interrupted: false } }] });
+  const turn = current.executor.runTurn({ ...current.input, signal: AbortSignal.timeout(500), onInteraction: async (interaction) => {
+    try { await interaction.submit({ type: "stop" }); return { type: "stop" }; }
+    finally { done.resolve(); }
+  } });
+  if (confirmation === "complete") assert.equal((await turn).text, "");
+  else await assert.rejects(turn);
+  assert.equal(current.calls.length, 1);
+  assert.equal(JSON.parse(await readFile(pipaPaths(current.runtime.home).openCodeRecovery, "utf8")).records.length, confirmation === "complete" ? 0 : 1);
+  current.wire.assertComplete();
+});
+
+test("U3 v2 reconnect duplicates produce one callback and reload cancellation makes replies inert", async (t) => {
+  let frames;
+  let streams = 0;
+  const current = await nativeInteractions(t, { forms: [nativeExamples.question], transport: async (url, init, fetch) => {
+    if (new URL(url).pathname !== "/api/event") return fetch(url, init);
+    streams++;
+    return new Response(new ReadableStream({ start(controller) {
+      frames = controller;
+      controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ id: `evt_${streams}`, created: 2, type: "form.created", data: { form: nativeExamples.question } })}\n\n`));
+      init.signal.addEventListener("abort", () => { try { controller.close(); } catch {} }, { once: true });
+    } }), { headers: { "content-type": "text/event-stream" } });
+  } });
+  const messages = current.document.routes.find((route) => route.path.endsWith("/message"));
+  const completed = messages.responses.at(-1);
+  messages.responses[messages.responses.length - 1] = { json: { data: [completed.json.data[0]], cursor: { previous: null, next: null } } };
+  const seen = [];
+  const turn = current.executor.runTurn({ ...current.input, onInteraction: async (interaction) => { seen.push(interaction); await interaction.settled; return { type: "answer", answers: [["Blue"], ["Fast"], ["name"]] }; } });
+  await waitFor(() => seen.length === 1);
+  frames.close();
+  await waitFor(() => streams === 2);
+  assert.equal(seen.length, 1);
+  current.pendingForms.splice(0);
+  await seen[0].settled;
+  await assert.rejects(seen[0].submit({ type: "reject" }), /settled/u);
+  messages.responses[messages.responses.length - 1] = completed;
+  assertTurnOutcome(await turn, current.document.expected);
+  assert.equal(current.calls.length, 0);
+  current.wire.assertComplete();
+});
+
+test("U3 v2 retains scoped permission notification callbacks and suppresses repeated replies", async (t) => {
+  const replied = { id: "evt_reply", created: 3, type: "permission.replied", data: { sessionID: "ses_child", requestID: "per_native", reply: "always" } };
+  const current = await nativeInteractions(t, { transport: async (url, init, fetch) => {
+    if (new URL(url).pathname !== "/api/event") return fetch(url, init);
+    const events = [
+      { ...replied, location: { directory: "/wrong" } },
+      { ...replied, data: { ...replied.data, sessionID: "ses_unrelated" } },
+      replied, replied,
+    ];
+    return new Response(new ReadableStream({ start(controller) {
+      controller.enqueue(new TextEncoder().encode(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")));
+      init.signal.addEventListener("abort", () => { try { controller.close(); } catch {} }, { once: true });
+    } }), { headers: { "content-type": "text/event-stream" } });
+  } });
+  const replies = [], reconciliations = [];
+  assertTurnOutcome(await current.executor.runTurn({ ...current.input,
+    onPermissionReplied: (reply) => replies.push(reply), onPermissionsReconciled: (snapshot) => reconciliations.push(snapshot),
+  }), current.document.expected);
+  assert.deepEqual(replies, [{ sessionId: "ses_child", requestId: "per_native", reply: "always" }]);
+  assert.ok(reconciliations.some((snapshot) => snapshot.sessionId === "ses_child" && snapshot.requestIds.size === 0));
+  assert.equal(reconciliations.some((snapshot) => snapshot.sessionId === "ses_unrelated"), false);
+  current.wire.assertComplete();
+});
+
+test("U3 real Slack controls + v2: rejected keyed answer stays editable, corrected answer submits once", async (t) => {
+  const complete = Promise.withResolvers();
+  const current = await nativeInteractions(t, { forms: [nativeExamples.question], onPrompt: () => complete.promise });
+  const reply = current.document.routes.find((route) => route.path.endsWith("frm_native/reply"));
+  reply.responses.unshift({ status: 400, json: { _tag: "FormInvalidAnswerError", id: "frm_native", message: "Try another name" } });
+  const posted = [], updated = [], deleted = [];
+  const thread = { id: "slack:C1:1.0", adapter: { webClient: { chat: {
+    postMessage: async (value) => { posted.push(value); return { ts: "2.0" }; },
+    update: async (value) => updated.push(value), delete: async (value) => deleted.push(value),
+  } } } };
+  const controls = createPendingInteractions(["U1"]);
+  let callbacks = 0;
+  const turn = current.executor.runTurn({ ...current.input, onInteraction: (interaction) => { callbacks++; return controls.onInteraction({ thread }, interaction); } });
+  await waitFor(() => posted.length === 1);
+  const action = (prefix, card = updated.at(-1) ?? posted[0]) => card.blocks.flatMap((block) => block.elements ?? []).find((element) => element.action_id.startsWith(prefix));
+  const click = (item, extra = {}) => controls.onAction({ threadId: thread.id, user: { userId: "U1" }, actionId: item.action_id, value: item.value, ...extra });
+  await click(action("pipa_select_"), { value: action("pipa_select_").options[0].value });
+  await click(action("pipa_submit_"));
+  const multi = action("pipa_select_");
+  await click(multi, { raw: { actions: [{ action_id: multi.action_id, selected_options: multi.options }] } });
+  await click(action("pipa_submit_"));
+  const custom = action("pipa_custom_");
+  await controls.onCustomAnswer({ privateMetadata: custom.value, relatedThread: thread, user: { userId: "U1" }, values: { answer: "first" } });
+  assert.equal(current.calls.length, 1);
+  assert.match(JSON.stringify(updated.at(-1)), /rejected/iu);
+  assert.ok(action("pipa_submit_"), "same card still has controls");
+  // Retry all three questions on the same token/card, with a corrected custom value.
+  await click(action("pipa_submit_"));
+  await click(action("pipa_submit_"));
+  await controls.onCustomAnswer({ privateMetadata: custom.value, relatedThread: thread, user: { userId: "U1" }, values: { answer: "corrected" } });
+  complete.resolve();
+  assertTurnOutcome(await turn, current.document.expected);
+  assert.deepEqual(current.calls.map((call) => call.body), [
+    { answer: { q0: "blue-id", q1: ["fast-id", "small-id"], q2: "first" } },
+    { answer: { q0: "blue-id", q1: ["fast-id", "small-id"], q2: "corrected" } },
+  ]);
+  assert.equal(callbacks, 1);
+  assert.equal(posted.length, 1);
+  assert.deepEqual(deleted, []);
+  current.wire.assertComplete();
+});
+
+for (const decision of ["once", "always", "reject"]) test(`U3 v2 permission ${decision}: legacy callbacks encode decision once`, async (t) => {
+  const done = Promise.withResolvers();
+  const current = await nativeInteractions(t, { permissions: [nativeExamples.permission], onPrompt: () => done.promise, onReply: () => done.resolve() });
+  const seen = [];
+  const result = await current.executor.runTurn({ ...current.input, onInteraction: (interaction) => {
+    seen.push(interaction.request);
+    return decision === "reject" ? { type: "reject" } : { type: "reply", reply: decision };
+  } });
+  assertTurnOutcome(result, current.document.expected);
+  assert.deepEqual(seen, [{ ...nativeExamples.permission, tool: { name: "bash", input: { command: "pwd" } } }]);
+  assert.deepEqual(current.calls.map((call) => call.body), [{ decision }]);
+  current.wire.assertComplete();
+});
+
+test("U3 native permission refusal is not treated as acceptance and the same request can be rejected", async (t) => {
+  const done = Promise.withResolvers();
+  const current = await nativeInteractions(t, { permissions: [nativeExamples.permission], onPrompt: () => done.promise });
+  const route = current.document.routes.find((route) => route.path.endsWith("per_native/reply"));
+  route.responses.unshift({ status: 403, json: { error: "Configured access is denied" } });
+  let retried = false;
+  const result = await current.executor.runTurn({ ...current.input, onInteraction: async (interaction) => {
+    try {
+      await assert.rejects(interaction.submit({ type: "reply", reply: "always" }));
+      assert.equal(current.pendingPermissions.length, 1);
+      await interaction.submit({ type: "reject" });
+      retried = true;
+      return { type: "reject" };
+    } finally { done.resolve(); }
+  } });
+  assertTurnOutcome(result, current.document.expected);
+  assert.equal(retried, true);
+  assert.deepEqual(current.calls.map((call) => call.body), [{ decision: "always" }, { decision: "reject" }]);
+  current.wire.assertComplete();
+});
+
+for (const lost of ["accepted", "pending"]) test(`U3 v2 lost reply reconciles ${lost} before another submission`, async (t) => {
+  const done = Promise.withResolvers();
+  let first = true;
+  const current = await nativeInteractions(t, { permissions: [nativeExamples.permission], onPrompt: () => done.promise,
+    onReply: (_, __, permissions) => {
+      if (!first) return;
+      if (lost === "accepted") permissions.splice(0);
+    },
+    transport: async (url, init, fetch) => {
+      const result = await fetch(url, init);
+      if (new URL(url).pathname.endsWith("/reply") && first) { first = false; throw new TypeError("lost native reply"); }
+      return result;
+    },
+  });
+  let reconciled = false;
+  const turn = current.executor.runTurn({ ...current.input, onInteraction: async (interaction) => {
+    try {
+      if (lost === "pending") {
+        await assert.rejects(interaction.submit({ type: "reply", reply: "once" }));
+        await interaction.submit({ type: "reply", reply: "always" });
+      } else {
+        await interaction.submit({ type: "reply", reply: "once" });
+        await interaction.settled;
+        await assert.rejects(interaction.submit({ type: "reply", reply: "always" }), /settled/u);
+      }
+      reconciled = true;
+      return { type: "reply", reply: "once" };
+    } finally { done.resolve(); }
+  } });
+  assertTurnOutcome(await turn, current.document.expected);
+  assert.equal(reconciled, true);
+  assert.equal(current.calls.length, lost === "accepted" ? 1 : 2);
+  const lastReply = current.wire.calls.findLastIndex((call) => call.path.endsWith("/reply"));
+  if (lost === "pending") assert.ok(current.wire.calls.slice(0, lastReply).some((call) => call.path.endsWith("/permission") && call.method === "GET"));
+  current.wire.assertComplete();
+});
+
+test("U3 v2 richer forms stay native-only; external settlement releases notices, foreign children stay invisible", async (t) => {
+  const forms = [...nativeExamples.rich, ...["ses_unrelated", "ses_wrong_location"].map((sessionID, index) => ({ ...nativeExamples.question, sessionID, id: `frm_foreign_${index}` }))];
+  const current = await nativeInteractions(t, { forms });
+  const messages = current.document.routes.find((route) => route.path.endsWith("/message"));
+  const completed = messages.responses.at(-1);
+  messages.responses[messages.responses.length - 1] = { json: { data: [completed.json.data[0]], cursor: { previous: null, next: null } } };
+  const posted = [], deleted = [];
+  const controls = createPendingInteractions();
+  const thread = { id: "slack:C1:1.0", adapter: { webClient: { chat: {
+    postMessage: async (value) => { posted.push(value); return { ts: String(posted.length) }; }, delete: async (value) => deleted.push(value),
+  } } } };
+  const seen = [];
+  const turn = current.executor.runTurn({ ...current.input, onInteraction: (interaction) => { seen.push(interaction.type); return controls.onInteraction({ thread }, interaction); } });
+  for (const [index, form] of nativeExamples.rich.entries()) {
+    await waitFor(() => posted.length === index + 1, { label: `rich form ${index} posted` });
+    assert.match(JSON.stringify(posted.at(-1)), /requires an OpenCode client/iu);
+    assert.equal(posted.at(-1).blocks.some((block) => block.type === "actions"), false);
+    current.pendingForms.splice(current.pendingForms.findIndex((item) => item.id === form.id), 1);
+    await waitFor(() => deleted.length === index + 1, { label: `rich form ${index} settled` });
+  }
+  messages.responses[messages.responses.length - 1] = completed;
+  assertTurnOutcome(await turn, current.document.expected);
+  assert.deepEqual(seen, ["form", "form", "form", "form"]);
+  assert.equal(current.calls.length, 0);
+  current.wire.assertComplete();
 });
 
 test("v1 baseline: real executor supersession aborts only the replaced thread", async (t) => {

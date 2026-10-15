@@ -381,7 +381,7 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
     try { return await selectedExecutor.runTurn({ prompt, workingDirectory: runtime.workspace, signal: controller.signal, ...input, onSession: async (id) => { session = id; await input.onSession?.(id); } }); }
     finally { clearTimeout(timer); if (controller.signal.aborted && session) await selectedExecutor.abortTurn(session); }
   };
-  const waitMessage = async (message) => runtime.waitFor(() => chat.reactions.some((item) => item.message === message.id && !item.added), { timeoutMs: 15_000, label: "Chat turn settlement" });
+  const waitMessage = async (message, label = "Chat turn settlement") => runtime.waitFor(() => chat.reactions.some((item) => item.message === message.id && !item.added), { timeoutMs: 15_000, label });
   const send = async (id, thread, mention = true) => {
     provider.register({ prompt: promptFor(id), text: textFor(id) });
     const message = chat.send(thread, promptFor(id), mention);
@@ -556,9 +556,8 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
       for (const [index, kind] of ["multi", "custom", "dismiss"].entries()) {
         const id = `question-${kind}`;
         const thread = `slack:CMATRIX:430.${index + 1}`;
-        provider.register({ prompt: promptFor(id), text: textFor(id), tool: { names: ["question", "form"], arguments: (_, tool) => tool.name === "question"
-          ? { questions: [{ header: "Matrix", question: "Select synthetic answers", multiple: kind === "multi", custom: true, options: kind === "custom" ? [] : [{ label: "Yes", description: "First" }, { label: "Other", description: "Second" }] }] }
-          : { title: "Matrix", fields: [{ key: "q0", type: kind === "multi" ? "array" : "string", title: "Select synthetic answers", options: [{ value: "Yes", label: "Yes" }, { value: "Other", label: "Other" }], required: true }] },
+        provider.register({ prompt: promptFor(id), text: textFor(id), tool: { names: ["question"], arguments: () =>
+          ({ questions: [{ header: "Matrix", question: "Select synthetic answers", multiple: kind === "multi", custom: true, options: kind === "custom" ? [] : [{ label: "Yes", description: "First" }, { label: "Other", description: "Second" }] }] }),
           ...(kind === "dismiss" ? {} : { verify: (results) => { const text = JSON.stringify(results); assert.ok(text.includes(kind === "custom" ? "Custom matrix answer" : "Yes")); if (kind === "multi") assert.ok(text.includes("Other")); } }),
         } });
         const message = chat.send(thread, promptFor(id));
@@ -580,11 +579,14 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
           const dismiss = elements.find((item) => item.action_id.startsWith("pipa_dismiss_"));
           await chat.handlers.action({ ...event, actionId: dismiss.action_id, value: dismiss.value });
         }
-        await waitMessage(message);
+        await waitMessage(message, `${kind} question turn settlement`);
         if (kind === "dismiss") {
           assert.ok(!chat.posts.some((item) => item.thread === thread));
           assert.match(control.updated.text, /Dismissed/u);
         } else assert.equal(chat.posts.find((item) => item.thread === thread)?.content.markdown, textFor(id));
+        assertNativeAdmissionCount(wires, promptFor(id), 1);
+        assert.equal(chat.controls.filter((item) => item.thread === thread).length, 1);
+        (cell.evidence.questionVariants ??= []).push({ kind, settled: true, nativeAdmissions: 1 });
       }
     },
     "question-rejected-retry": async () => {
@@ -820,10 +822,12 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
       if (requireExecutor()) return requireExecutor();
       const before = await readFile(definitions.pluginLog, "utf8").then((text) => text.trim().split("\n").map(JSON.parse), (error) => { if (error.code === "ENOENT") return []; throw error; });
       await definitions.rewritePlugin(2);
-      const response = await fetch(`${baseUrl}/instance/dispose?directory=${encodeURIComponent(runtime.workspace)}`, { method: "POST", headers, signal: AbortSignal.timeout(5000) });
+      // Native 2.0.29 reloads all loaded locations; this cell owns one private server.
+      const endpoint = pin.startsWith("2.") ? "/api/location/reload" : `/instance/dispose?directory=${encodeURIComponent(runtime.workspace)}`;
+      const response = await fetch(`${baseUrl}${endpoint}`, { method: "POST", headers, signal: AbortSignal.timeout(5000) });
       assert.ok(response.ok, `Native location reload returned HTTP ${response.status}`);
       await health();
-      const after = (await readFile(definitions.pluginLog, "utf8")).trim().split("\n").map(JSON.parse);
+      const after = await readFile(definitions.pluginLog, "utf8").then((text) => text.trim().split("\n").map(JSON.parse), (error) => { if (error.code === "ENOENT") return []; throw error; });
       cell.evidence.reload = { pluginLoadsBefore: before.filter((item) => item.kind === "loaded").length, pluginLoadsAfter: after.filter((item) => item.kind === "loaded").length };
       const session = cell.evidence.sessionId;
       assert.ok(session);

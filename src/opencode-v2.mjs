@@ -121,7 +121,24 @@ export function createV2Adapter(options) {
     const own = index >= 0 ? fresh[index] : null;
     const idle = index >= 0 ? fresh.slice(index + 1).find((message) => message.type === "idle") : null;
     const assistant = idle ? fresh.slice(index + 1, fresh.indexOf(idle)).findLast((message) => message.type === "assistant") : null;
-    return { foreign, own, idle, assistant, inbox };
+    let dismissed = false;
+    if (own && !idle && !foreign && record.dismissal && !inbox.length) {
+      const message = fresh.slice(index + 1).find((message) => message.id === record.dismissal.messageId && message.type === "assistant");
+      const tool = message?.content.find((part) => part.type === "tool" && part.id === record.dismissal.toolId && part.name === "question");
+      if (typeof message?.time.completed === "number" && message.error?.type === "aborted" && tool?.state.status === "error" && tool.state.error?.type === "aborted") {
+        let cancelled;
+        try {
+          const form = await client.session.form.get({ sessionID: record.sessionId, formID: record.dismissal.formId }, { signal });
+          cancelled = form.id === record.dismissal.formId && form.sessionID === record.sessionId && form.state.status === "cancelled";
+        } catch (error) { if (error._tag !== "FormNotFoundError" || error.id !== record.dismissal.formId) throw error; cancelled = true; }
+        // Native question cancellation can stop execution with reason=shutdown,
+        // which deliberately has no idle projection. This is not general success:
+        // require journaled dismissal intent, its exact aborted tool/assistant,
+        // native cancellation/absence and no active execution before cleanup.
+        if (cancelled) dismissed = !(await client.session.active({ signal }))[record.sessionId];
+      }
+    }
+    return { foreign, own, idle, assistant, inbox, dismissed };
   }
 
   async function cleanup(record) {
@@ -169,7 +186,7 @@ export function createV2Adapter(options) {
             await mutate((items) => items.map((item) => item.key === record.key ? { ...record } : item));
           }
         }
-        if (state.own && !state.idle) {
+        if (state.own && !state.idle && !state.dismissed) {
           if (foreign || record.foreign) throw new Error("OpenCode attribution conflict: a foreign writer is still active.");
           // Native interrupt acknowledges acceptance, not settlement. Under KTD3's
           // single-writer contract it stops our active execution; never use it to
@@ -180,8 +197,8 @@ export function createV2Adapter(options) {
             state = await projection(record, signal);
             foreign ||= state.foreign;
             if (foreign || record.foreign) throw new Error("OpenCode attribution conflict: foreign input entered during cancellation.");
-            if (!state.idle) await delay(options.pollIntervalMs, undefined, { signal });
-          } while (!state.idle);
+            if (!state.idle && !state.dismissed) await delay(options.pollIntervalMs, undefined, { signal });
+          } while (!state.idle && !state.dismissed);
         }
         if (!state.own && record.phase !== "cancelled") throw new Error("OpenCode prompt admission remains uncertain.");
       }
@@ -219,6 +236,7 @@ export function createV2Adapter(options) {
             || !Array.isArray(record.baseline) || !record.baseline.every((id) => typeof id === "string")
             || !["prepared", "admitting", "admitted", "cancelled"].includes(record.phase)
             || (record.instruction !== undefined && !["absent", "putting", "present"].includes(record.instruction))
+            || (record.dismissal !== undefined && (!record.dismissal || ![record.dismissal.formId, record.dismissal.messageId, record.dismissal.toolId].every((id) => typeof id === "string" && id.length)))
             || typeof record.workingDirectory !== "string" || path.resolve(record.workingDirectory) !== path.resolve(workingDirectory)) throw new Error("Invalid or mismatched Pipa OpenCode recovery ownership.");
           keys.add(record.key);
           await cleanup(record);
@@ -250,7 +268,7 @@ export function createV2Adapter(options) {
       if (inbox.length || active[sessionId] || turns.has(sessionId)) throw new Error("OpenCode attribution conflict: the session already has an active writer.");
       return { sessionId, baseline: baseline.map((message) => message.id) };
     },
-    async execute({ sessionId, baseline, workingDirectory, controller, prompt, files, instructions }) {
+    async execute({ sessionId, baseline, workingDirectory, controller, prompt, files, instructions, onInteraction, onPermissionReplied, onPermissionsReconciled }) {
       if (blocked) throw blocked;
       const signal = controller.signal;
       const record = { sessionId, workingDirectory, baseline, id: options.inputId?.() ?? `msg_${randomUUID().replaceAll("-", "")}`,
@@ -259,6 +277,149 @@ export function createV2Adapter(options) {
       let stream;
       let watching;
       let streamError;
+      let dismissed = false;
+      let permissionRejected = false;
+      const interactions = new Map();
+      const interactionSessions = new Set([sessionId]);
+      const permissionReplies = new Set();
+      async function belongs(candidate) {
+        const original = candidate;
+        const visited = new Set();
+        while (candidate && !visited.has(candidate)) {
+          visited.add(candidate);
+          let session;
+          try { session = await readWithRecovery((readSignal) => client.session.get({ sessionID: candidate }, { signal: readSignal }), signal); }
+          catch (error) { if (error._tag === "SessionNotFoundError") return false; throw error; }
+          if (session?.id !== candidate || typeof session.location?.directory !== "string" || path.resolve(session.location.directory) !== path.resolve(workingDirectory)) return false;
+          if (candidate === sessionId) { interactionSessions.add(original); return true; }
+          candidate = session.parentID;
+        }
+        return false;
+      }
+      function settle(entry) {
+        if (entry.accepted || entry.external) return;
+        entry.external = true;
+        entry.settled.resolve();
+      }
+      async function awaitSubmissions() {
+        while (true) {
+          const submissions = [...interactions.values()].filter((entry) => entry.submitting).map((entry) => entry.submission);
+          if (!submissions.length) return;
+          // HTTP acknowledgements have the client's request deadline; uncertain
+          // responses use bounded authoritative recovery before this resolves.
+          await Promise.allSettled(submissions);
+        }
+      }
+      async function dispatch(kind, request) {
+        const key = `${kind}:${request.sessionID}:${request.id}`;
+        if (!onInteraction || interactions.has(key) || !await belongs(request.sessionID)) return;
+        if (interactions.has(key) || signal.aborted) return;
+        const fields = request.fields;
+        const question = kind === "form" && request.metadata?.kind === "question" && Array.isArray(fields) && fields.length
+          && fields.every((field, index) => field.key === `q${index}` && ["string", "multiselect"].includes(field.type) && !field.hidden && !field.when?.length);
+        const type = kind === "permission" ? "permission" : question ? "question" : "form";
+        let tool;
+        if (kind === "permission" && request.source?.type === "tool") {
+          try {
+            const message = await readWithRecovery((readSignal) => client.session.message.get({ sessionID: request.sessionID, messageID: request.source.messageID }, { signal: readSignal }), signal);
+            const part = message.content?.find((part) => part.type === "tool" && part.id === request.source.id);
+            if (part) tool = { name: part.name, input: part.state?.input };
+          } catch (error) { if (error._tag !== "MessageNotFoundError") throw error; }
+        }
+        if (interactions.has(key) || signal.aborted) return;
+        const normalized = question ? { ...request, questions: fields.map((field) => ({
+          header: field.title || request.title, question: field.description || field.title || request.title,
+          multiple: field.type === "multiselect", custom: field.custom ?? !field.options?.length,
+          options: field.options?.map((option) => ({ label: option.label, description: option.description })),
+        })) } : tool ? { ...request, tool } : request;
+        const entry = { kind, request, settled: Promise.withResolvers() };
+        interactions.set(key, entry);
+        const submitDecision = async (decision) => {
+          if (entry.accepted) return;
+          if (entry.external) throw new Error("OpenCode request is already settled.");
+          if (type === "form") throw new Error("This form requires an OpenCode client response.");
+          signal.throwIfAborted();
+          entry.submitting = true;
+          const native = { sessionID: request.sessionID, ...(kind === "form" ? { formID: request.id } : { requestID: request.id }) };
+          try {
+            // Reconcile an earlier lost reply before permitting another mutation.
+            if (!await pending(entry)) { settle(entry); throw new Error("OpenCode request is already settled."); }
+            try {
+              if (kind === "permission") {
+                const decisionValue = ["reject", "stop"].includes(decision?.type) ? "reject" : decision?.type === "reply" ? decision.reply : null;
+                if (!["once", "always", "reject"].includes(decisionValue)) throw new Error("Invalid OpenCode permission decision.");
+                await client.permission.reply({ ...native, decision: decisionValue }, { signal });
+              } else if (["reject", "stop"].includes(decision?.type)) {
+                if (decision.type === "stop" && request.sessionID === sessionId && typeof request.metadata?.tool?.messageID === "string" && typeof request.metadata.tool.id === "string") {
+                  record.dismissal = { formId: request.id, messageId: request.metadata.tool.messageID, toolId: request.metadata.tool.id };
+                  await mutate((items) => items.map((item) => item.key === record.key ? { ...record } : item));
+                }
+                await client.session.form.cancel(native, { signal });
+              } else if (question && decision?.type === "answer") {
+                if (!Array.isArray(decision.answers) || decision.answers.length !== fields.length) throw new Error("Invalid OpenCode question answers.");
+                const answer = Object.fromEntries(fields.map((field, index) => {
+                  const values = decision.answers[index];
+                  if (!Array.isArray(values) || !values.every((value) => typeof value === "string") || (field.type === "string" && values.length !== 1)) throw new Error("Invalid OpenCode question answer.");
+                  const encoded = values.map((value) => field.options?.find((option) => option.label === value)?.value ?? value);
+                  return [field.key, field.type === "multiselect" ? encoded : encoded[0]];
+                }));
+                await client.session.form.reply({ ...native, answer }, { signal });
+              } else throw new Error("This form requires an OpenCode client response.");
+            } catch (error) {
+              signal.throwIfAborted();
+              if (retryable(error) || error.reason === "MalformedResponse" || ["FormAlreadySettledError", "FormNotFoundError", "PermissionNotFoundError"].includes(error._tag)) {
+                if (!await pending(entry)) { settle(entry); return; }
+              }
+              throw error;
+            }
+            entry.accepted = true;
+            if (kind === "permission" && (decision.type === "reject" || decision.reply === "reject")) permissionRejected = true;
+            if (decision.type === "stop") {
+              dismissed = true;
+              await client.session.interrupt({ sessionID: request.sessionID, resume: false }, { signal });
+            }
+          } finally { entry.submitting = false; }
+        };
+        const submit = (decision) => {
+          if (entry.submitting) return Promise.reject(new Error("OpenCode response is already being submitted."));
+          entry.submission = submitDecision(decision);
+          return entry.submission;
+        };
+        void Promise.resolve().then(() => onInteraction({ type, request: normalized, sessionId: request.sessionID, signal, submit, settled: entry.settled.promise }))
+          .then(async (decision) => {
+            if (!entry.accepted && !entry.external && !signal.aborted && !["cancelled", "stopped"].includes(decision?.type)) await submit(decision);
+          }).catch((error) => { if (!signal.aborted) process.stderr.write(`OpenCode interaction handler error: ${error.message}\n`); });
+      }
+      async function pending(entry) {
+        return readWithRecovery(async (readSignal) => {
+          if (!await belongs(entry.request.sessionID)) return false;
+          if (entry.kind === "permission") return (await client.permission.list({ sessionID: entry.request.sessionID }, { signal: readSignal })).some((item) => item.id === entry.request.id);
+          try { return (await client.session.form.get({ sessionID: entry.request.sessionID, formID: entry.request.id }, { signal: readSignal })).state.status === "pending"; }
+          catch (error) { if (error._tag === "FormNotFoundError") return false; throw error; }
+        }, signal);
+      }
+      async function reconcileInteractions() {
+        if (!onInteraction && !onPermissionsReconciled) return;
+        const before = [...interactions.values()];
+        const input = { location: { directory: workingDirectory } };
+        const snapshots = await readWithRecovery(async (readSignal) => Promise.all([
+          client.form.list(input, { signal: readSignal }), client.permission.request.list(input, { signal: readSignal }),
+        ]), signal);
+        for (const [index, snapshot] of snapshots.entries()) {
+          if (path.resolve(snapshot.location?.directory ?? "") !== path.resolve(workingDirectory) || !Array.isArray(snapshot.data)) throw new Error("OpenCode returned invalid interaction location projections.");
+          const kind = index === 0 ? "form" : "permission";
+          for (const request of snapshot.data) await dispatch(kind, request);
+          for (const entry of before) {
+            if (entry.kind === kind && !entry.accepted && !entry.submitting && !entry.external
+              && !snapshot.data.some((request) => request.id === entry.request.id && request.sessionID === entry.request.sessionID)) settle(entry);
+          }
+          if (kind === "permission" && onPermissionsReconciled) {
+            const scoped = [];
+            for (const request of snapshot.data) if (await belongs(request.sessionID)) scoped.push(request);
+            for (const sessionId of interactionSessions) onPermissionsReconciled({ sessionId, requestIds: new Set(scoped.filter((request) => request.sessionID === sessionId).map((request) => request.id)) });
+          }
+        }
+      }
       try {
         await mutate((items) => [...items, { ...record }]);
         signal.throwIfAborted();
@@ -276,6 +437,18 @@ export function createV2Adapter(options) {
               for await (const event of events.event.subscribe({ signal: streamSignal })) {
                 if (typeof event?.type !== "string" || !event.data || typeof event.id !== "string") throw new Error("OpenCode returned an invalid event.");
                 if (event.type === "session.inbox.enqueued" && event.data.sessionID === sessionId && event.data.inboxID !== record.id) record.foreign = true;
+                if ((onInteraction || onPermissionReplied || onPermissionsReconciled) && (!event.location || path.resolve(event.location.directory ?? "") === path.resolve(workingDirectory))) {
+                  if (event.type === "form.created") await dispatch("form", event.data.form);
+                  if (event.type === "permission.asked") await dispatch("permission", event.data);
+                  if (event.type === "permission.replied" && onPermissionReplied && await belongs(event.data.sessionID)) {
+                    const key = `${event.data.sessionID}:${event.data.requestID}`;
+                    if (!permissionReplies.has(key)) {
+                      permissionReplies.add(key);
+                      onPermissionReplied({ sessionId: event.data.sessionID, requestId: event.data.requestID, reply: event.data.reply });
+                    }
+                  }
+                  if (["form.replied", "form.cancelled", "permission.replied", "location.shutdown"].includes(event.type)) await reconcileInteractions();
+                }
               }
             } catch (error) {
               if (streamSignal.aborted) return;
@@ -296,6 +469,7 @@ export function createV2Adapter(options) {
           throw error;
         } finally { clearTimeout(subscriptionTimer); }
         signal.throwIfAborted();
+        await reconcileInteractions();
         record.instruction = "putting";
         await mutate((items) => items.map((item) => item.key === record.key ? { ...record } : item));
         // Cancellation waits for this independently bounded mutation before cleanup.
@@ -308,6 +482,7 @@ export function createV2Adapter(options) {
         let admissionDisconnectedAt;
         while (true) {
           if (streamError) throw streamError;
+          await reconcileInteractions();
           const state = await projection(record, signal);
           if (state.foreign || record.foreign) throw new Error("OpenCode attribution conflict: foreign input entered the Pipa turn.");
           if (state.own || state.inbox.some((item) => item.id === record.id)) break;
@@ -342,13 +517,18 @@ export function createV2Adapter(options) {
         await mutate((items) => items.map((item) => item.key === record.key ? { ...record } : item));
         while (true) {
           if (streamError) throw streamError;
+          await reconcileInteractions();
           const state = await projection(record, signal);
           if (state.foreign || record.foreign) throw new Error("OpenCode attribution conflict: foreign input entered the Pipa turn.");
           if (state.own?.text !== undefined && state.own.text !== prompt) throw new Error("OpenCode attribution conflict: projected input differs from the admitted prompt.");
+          if (state.dismissed || state.idle) await awaitSubmissions();
+          if (state.dismissed) return "";
           if (state.idle) {
+            if (dismissed) return "";
             if (state.idle.outcome !== "succeeded" || state.assistant?.error || state.assistant?.finish !== "stop"
               || typeof state.assistant.time?.completed !== "number" || state.assistant.retry) throw new Error("OpenCode failed to complete the turn.");
             const text = state.assistant.content.filter((part) => part.type === "text" && typeof part.text === "string").map((part) => part.text).join("\n").trim();
+            if (!text && permissionRejected) return "Stopped after a permission was rejected.";
             if (!text) throw new Error("OpenCode completed without assistant text.");
             return text;
           }
@@ -358,6 +538,8 @@ export function createV2Adapter(options) {
         if (signal.aborted) throw signal.reason;
         throw error;
       } finally {
+        await awaitSubmissions();
+        for (const entry of interactions.values()) settle(entry);
         let foreign;
         try {
           try {

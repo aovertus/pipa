@@ -22,7 +22,10 @@ export async function createProvider(runtime) {
       const body = JSON.parse(data);
       assert.ok(["matrix", "matrix-next"].includes(body.model), "Unexpected provider model");
       assert.ok(Array.isArray(body.messages), "Unexpected provider messages");
-      const lastUser = body.messages.findLastIndex((message) => message.role === "user");
+      // V2 may append this native synthetic user message after location reload/MCP
+      // discovery. It is not another prompt and must not hide preceding tool results.
+      const lastUser = body.messages.findLastIndex((message) => message.role === "user" && !(typeof message.content === "string"
+        && message.content.startsWith("<system-update>\nThe Code Mode tool catalog has changed.\n") && message.content.endsWith("</system-update>")));
       const content = JSON.stringify(body.messages[lastUser]?.content);
       const direct = [...scripts.values()].filter((script) => content?.includes(script.prompt));
       const matches = direct.length ? direct : [...scripts.values()].filter((script) => script.match?.(body.messages));

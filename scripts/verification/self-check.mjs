@@ -174,6 +174,24 @@ test("unexpected provider routes and unregistered prompts are sticky failures", 
   } finally { await runtime.teardown(); }
 });
 
+test("native Code Mode catalog update preserves the registered prompt and tool result boundary", async () => {
+  const runtime = await createRuntimeFixture();
+  try {
+    const provider = await createProvider(runtime);
+    provider.register({ prompt: "REGISTERED_PROMPT", text: "DONE" });
+    const request = (messages) => fetch(`${provider.url}/chat/completions`, { method: "POST", body: JSON.stringify({ model: "matrix", messages }) });
+    const messages = [{ role: "user", content: "REGISTERED_PROMPT" }, { role: "tool", content: "Custom answer", tool_call_id: "test" }];
+    const update = { role: "user", content: "<system-update>\nThe Code Mode tool catalog has changed.\n\nNew tools are available in addition to those previously listed:\n  - tools.matrix.nonce(): Promise&lt;unknown&gt; // Return a synthetic matrix marker\n</system-update>" };
+    const response = await request([...messages, update]);
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).choices[0].message.content, "DONE");
+    assert.deepEqual(provider.receipts[0].toolResults, [messages[1]]);
+    provider.assertClean();
+    assert.equal((await request([...messages, { role: "user", content: "unregistered real prompt" }, update])).status, 500, "must not search past an unknown user prompt");
+    assert.equal((await request([...messages, { role: "user", content: "<system-update>arbitrary unknown input</system-update>" }])).status, 500);
+  } finally { await runtime.teardown(); }
+});
+
 test("evidence refuses unknown status and common N/A; baseline remains strict", async () => {
   const rows = [];
   await recordCase(rows, { id: "red", expected: "pass" }, async () => { throw new Error("observed failure"); });

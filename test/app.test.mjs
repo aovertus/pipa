@@ -1891,6 +1891,85 @@ test("only allowed users can answer an active question", async () => {
   assert.deepEqual(resolvedDecision, { type: "answer", answers: [["X"]] });
 });
 
+test("native rejection retains the same editable controls until acceptance", async () => {
+  const posted = [], updated = [];
+  const thread = slackInteractionThread({ posted, updated });
+  const interactions = createPendingInteractions(["U1"]);
+  let attempts = 0, resolved = false;
+  const acceptance = Promise.withResolvers();
+  const result = interactions.onInteraction({ thread }, {
+    type: "question", sessionId: "ses_retry", signal: AbortSignal.timeout(5000),
+    request: { id: "q_retry", questions: [{ question: "Pick", options: [{ label: "X" }], custom: true }] },
+    submit: async () => { if (++attempts === 1) throw new Error("Native answer rejected"); await acceptance.promise; },
+  }).then((value) => { resolved = true; return value; });
+  await waitFor(() => posted.length === 1);
+  const select = slackAction(posted[0], "pipa_select_");
+  const submit = slackAction(posted[0], "pipa_submit_");
+  const event = (action, value = action.value) => ({ actionId: action.action_id, value, threadId: thread.id, user: { userId: "U1" } });
+  await interactions.onAction(event(select, select.options[0].value));
+  await interactions.onAction(event(submit));
+  await waitFor(() => updated.length > 0);
+  assert.equal(attempts, 1);
+  assert.equal(resolved, false);
+  assert.match(JSON.stringify(updated), /rejected/iu);
+  const retry = interactions.onAction(event(submit));
+  await waitFor(() => attempts === 2);
+  await interactions.onAction(event(submit));
+  assert.equal(attempts, 2, "double clicks must not submit twice");
+  assert.equal(resolved, false);
+  acceptance.resolve();
+  await retry;
+  assert.deepEqual(await result, { type: "answer", answers: [["X"]] });
+  assert.equal(posted.length, 1);
+});
+
+test("native external settlement and queued cancellation make stale Slack controls inert", async () => {
+  const posted = [], deleted = [];
+  const thread = slackInteractionThread({ posted, deleted });
+  const interactions = createPendingInteractions();
+  const external = Promise.withResolvers();
+  const controller = new AbortController();
+  let submissions = 0;
+  const request = { type: "permission", sessionId: "ses_child", request: { id: "per_native", action: "read", resources: ["test"] }, signal: AbortSignal.timeout(5000), submit: async () => { submissions++; } };
+  const first = interactions.onInteraction({ thread }, { ...request, settled: external.promise });
+  await waitFor(() => posted.length === 1);
+  const queued = interactions.onInteraction({ thread }, { ...request, request: { ...request.request, id: "queued" }, signal: controller.signal });
+  const cancelled = assert.rejects(queued, /cancel queued/u);
+  controller.abort(new Error("cancel queued"));
+  const allow = slackAction(posted[0], "pipa_permission_once_");
+  external.resolve();
+  assert.deepEqual(await first, { type: "cancelled" });
+  await cancelled;
+  await interactions.onAction({ actionId: allow.action_id, value: allow.value, threadId: thread.id, user: { userId: "U1" } });
+  assert.equal(posted.length, 1, "cancelled queued cards must never be posted");
+  assert.equal(deleted.length, 1);
+  assert.equal(submissions, 0);
+});
+
+test("native submission still checks current routine authorization and exact thread", async () => {
+  const posted = [];
+  const thread = slackInteractionThread({ posted });
+  const interactions = createPendingInteractions();
+  let allowed = ["U1"], authorized = true, submissions = 0;
+  const result = interactions.onInteraction({ thread, loadAllowedUserIds: async () => allowed, authorize: async () => { if (!authorized) throw new Error("revoked"); } }, {
+    type: "permission", sessionId: "ses_child", request: { id: "per_native", action: "read", resources: ["test"] }, signal: AbortSignal.timeout(5000), submit: async () => { submissions++; },
+  });
+  await waitFor(() => posted.length === 1);
+  const allow = slackAction(posted[0], "pipa_permission_once_");
+  const click = (threadId = thread.id, userId = "U1") => interactions.onAction({ actionId: allow.action_id, value: allow.value, threadId, user: { userId } });
+  await click("slack:C1:wrong");
+  await click(thread.id, "U2");
+  allowed = ["U2"];
+  await click();
+  authorized = false;
+  await click(thread.id, "U2");
+  assert.equal(submissions, 0);
+  authorized = true;
+  await click(thread.id, "U2");
+  assert.deepEqual(await result, { type: "reply", reply: "once" });
+  assert.equal(submissions, 1);
+});
+
 test("routine interactions and results target an exact channel or existing thread", async () => {
   for (const destination of [
     { channelId: "C1" },

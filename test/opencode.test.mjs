@@ -828,7 +828,7 @@ test("does not impose executor timeouts on OpenCode work", async () => {
         },
       }), { status: 200 });
     }
-    if (pathname === "/permission") return jsonResponse([]);
+    if (pathname === "/permission" || pathname === "/question") return jsonResponse([]);
     if (pathname === "/session/status") {
       if (prompted && !statusRead) {
         statusRead = true;
@@ -859,7 +859,7 @@ test("routes a subagent permission through its parent session", async () => {
   const fetch = async (url) => {
     const pathname = new URL(url).pathname;
     if (pathname === "/event") return new Response(new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode(event)); controller.close(); } }), { status: 200 });
-    if (pathname === "/permission") return jsonResponse([]);
+    if (pathname === "/permission" || pathname === "/question") return jsonResponse([]);
     if (pathname === "/session/ses_child") return jsonResponse({ id: "ses_child", parentID: "ses_1" });
     if (pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
     if (pathname === "/session/ses_1/message") return jsonResponse(prompted ? [{ info: { id: "new", role: "assistant", time: { completed: 1 } }, parts: [{ type: "text", text: "done" }] }] : []);
@@ -888,7 +888,7 @@ test("forwards permission replies from the OpenCode event stream", async () => {
   const fetch = async (url) => {
     const pathname = new URL(url).pathname;
     if (pathname === "/event") return new Response(new ReadableStream({ start(controller) { events.forEach((event) => controller.enqueue(new TextEncoder().encode(event))); controller.close(); } }), { status: 200 });
-    if (pathname === "/permission") return jsonResponse([]);
+    if (pathname === "/permission" || pathname === "/question") return jsonResponse([]);
     if (pathname === "/session/status") return jsonResponse({ ses_1: { type: "idle" } });
     if (pathname === "/session/ses_1/message") return jsonResponse(prompted ? [{ info: { id: "new", role: "assistant", time: { completed: 1 } }, parts: [{ type: "text", text: "done" }] }] : []);
     if (pathname.endsWith("/prompt_async")) { prompted = true; return new Response(null, { status: 204 }); }

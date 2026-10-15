@@ -10,6 +10,7 @@
   "expected": { "sessionId": "ses_contract", "text": "contract complete" },
   "continuation": { "sessionId": "ses_contract", "text": "history retained" },
   "routes": [
+    { "method": "GET", "path": "/question", "query": { "directory": "$WORKSPACE" }, "repeatLast": true, "responses": [{ "json": [] }] },
     {
       "method": "GET", "path": "/path", "query": { "directory": "$WORKSPACE" },
       "responses": [{ "json": { "directory": "$WORKSPACE", "worktree": "$WORKSPACE", "home": "$TEMP", "state": "$TEMP", "config": "$TEMP" } }]
