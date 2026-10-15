@@ -106,6 +106,7 @@ export function createOpenCodeExecutor(options = {}) {
   const active = new Set();
   const activeSessions = new Map();
   let adapter;
+  let capabilities;
   let readiness;
   let stopReason;
 
@@ -113,6 +114,7 @@ export function createOpenCodeExecutor(options = {}) {
     readiness ??= (async () => {
       const connection = options.connection ?? await checkOpenCodeConnection(baseUrl, workingDirectory, { ...options, environment, fetch: fetchImpl });
       headers = connection.headers ?? headers;
+      capabilities = Object.freeze({ modelDiscovery: connection.major === 2, liveModelSwitch: connection.major === 2 });
       adapter = connection.major === 2
         ? createV2Adapter({ ...options, baseUrl, fetch: fetchImpl, headers, environment, pollIntervalMs })
         : createV1Adapter({ request, baseUrl, fetchImpl, headers, pollIntervalMs });
@@ -235,8 +237,48 @@ export function createOpenCodeExecutor(options = {}) {
   }
 
   return {
+    // Unknown until authenticated runtime negotiation has completed.
+    get capabilities() { return capabilities; },
     ready,
     runTurn,
+    async listModels({ workingDirectory, signal } = {}) {
+      if (stopReason) throw stopReason;
+      const controller = new AbortController();
+      const abort = () => controller.abort(signal.reason);
+      if (signal?.aborted) abort();
+      else signal?.addEventListener("abort", abort, { once: true });
+      active.add(controller);
+      try {
+        await ready(workingDirectory);
+        controller.signal.throwIfAborted();
+        if (!capabilities.modelDiscovery) throw new Error("OpenCode model discovery is not supported by this adapter.");
+        const catalog = await adapter.listModels(workingDirectory, controller.signal);
+        controller.signal.throwIfAborted();
+        return catalog;
+      } finally {
+        controller.abort();
+        active.delete(controller);
+        signal?.removeEventListener("abort", abort);
+      }
+    },
+    async switchModel({ sessionId, model, workingDirectory, signal } = {}) {
+      if (stopReason) throw stopReason;
+      const controller = new AbortController();
+      const abort = () => controller.abort(signal.reason);
+      if (signal?.aborted) abort();
+      else signal?.addEventListener("abort", abort, { once: true });
+      active.add(controller);
+      try {
+        await ready(workingDirectory);
+        controller.signal.throwIfAborted();
+        if (!capabilities.liveModelSwitch) throw new Error("OpenCode live model switching is not supported by this adapter.");
+        return await adapter.switchModel(sessionId, model, workingDirectory, controller.signal);
+      } finally {
+        controller.abort();
+        active.delete(controller);
+        signal?.removeEventListener("abort", abort);
+      }
+    },
     async abortTurn(sessionId, reason = new Error("OpenCode turn aborted.")) {
       const turn = activeSessions.get(sessionId);
       if (!turn) return;

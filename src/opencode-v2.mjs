@@ -249,8 +249,47 @@ export function createV2Adapter(options) {
     await readiness;
   }
 
+  async function listModels(workingDirectory, signal) {
+    const input = { location: { directory: workingDirectory } };
+    const [catalog, defaults] = await readWithRecovery((readSignal) => Promise.all([
+      client.model.list(input, { signal: readSignal }), client.model.default(input, { signal: readSignal }),
+    ]), signal);
+    for (const snapshot of [catalog, defaults]) {
+      if (typeof snapshot?.location?.directory !== "string" || path.resolve(snapshot.location.directory) !== path.resolve(workingDirectory)) throw new Error("OpenCode model workspace identity mismatch.");
+    }
+    if (!Array.isArray(catalog.data) || catalog.data.some((model) => !model || typeof model.id !== "string" || !model.id
+      || typeof model.providerID !== "string" || !model.providerID || typeof model.name !== "string" || typeof model.enabled !== "boolean"
+      || !Array.isArray(model.variants) || model.variants.some((variant) => typeof variant?.id !== "string" || !variant.id))) throw new Error("OpenCode returned an invalid model catalog.");
+    // Native discovery resolves configured/connected providers. Never expose its
+    // settings/headers/body: these can contain provider credentials.
+    const models = catalog.data.filter((model) => model.enabled).map((model) => ({
+      providerID: model.providerID, id: model.id, name: model.name, variants: [...new Set(["default", ...model.variants.map((variant) => variant.id)])],
+    }));
+    const selected = defaults.data;
+    if (selected !== null && (!selected || typeof selected.providerID !== "string" || typeof selected.id !== "string")) throw new Error("OpenCode returned an invalid default model.");
+    const defaultModel = selected && models.find((model) => model.providerID === selected.providerID && model.id === selected.id);
+    return { models, defaultModel: defaultModel ? { providerID: defaultModel.providerID, id: defaultModel.id, variant: "default" } : null };
+  }
+
   return {
     ready,
+    listModels,
+    async switchModel(sessionId, model, workingDirectory, signal) {
+      if (typeof sessionId !== "string" || !sessionId) throw new Error("Invalid OpenCode session ID.");
+      if (model !== null && (!model || typeof model.providerID !== "string" || !model.providerID || typeof model.id !== "string" || !model.id
+        || (model.variant !== undefined && (typeof model.variant !== "string" || !model.variant)))) throw new Error("Invalid OpenCode model selection.");
+      const catalog = await listModels(workingDirectory, signal);
+      // 2.0.29 has no nullable switch/reset operation. Reset resolves the native
+      // default now, then selects it explicitly; it does not clear a stored override.
+      const selection = model === null ? catalog.defaultModel : { providerID: model.providerID, id: model.id, variant: model.variant ?? "default" };
+      const available = selection && catalog.models.find((item) => item.providerID === selection.providerID && item.id === selection.id);
+      if (!available || !available.variants.includes(selection.variant)) throw new Error("OpenCode model or variant is unavailable.");
+      if (!await lookup(sessionId, workingDirectory, signal)) throw new Error("OpenCode session is unavailable; model selection did not create a replacement.");
+      signal.throwIfAborted();
+      // Do not retry a mutation with an uncertain acknowledgement or interrupt an
+      // in-flight step. Native switching applies to subsequent provider steps.
+      await client.session.switchModel({ sessionID: sessionId, model: selection }, { signal });
+    },
     async resolveSession(sessionId, workingDirectory, controller) {
       const signal = controller.signal;
       if (sessionId && !await lookup(sessionId, workingDirectory, signal)) sessionId = null;

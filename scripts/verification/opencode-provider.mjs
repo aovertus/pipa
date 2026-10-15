@@ -35,9 +35,9 @@ export async function createProvider(runtime) {
       const tools = (body.tools ?? []).map((tool) => tool.function ?? tool);
       const after = body.messages.slice(lastUser + 1);
       const toolResults = after.filter((message) => message.role === "tool");
-      const receipt = { prompt: script.prompt, model: body.model, tools, toolResults, closed: false };
+      const receipt = { prompt: script.prompt, model: body.model, provider: req.headers["x-matrix-provider"], temperature: body.temperature, tools, toolResults, closed: false };
       receipts.push(receipt);
-      if (script.hold) {
+      if (script.hold && (!script.holdOnce || script.calls === 1)) {
         await new Promise((resolve) => {
           script.release = () => { receipt.released = true; resolve(); };
           res.once("close", () => { receipt.closed = true; resolve(); });

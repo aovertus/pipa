@@ -32,7 +32,13 @@ test("release catalog keeps four crash boundaries and separate unqualified model
   for (const id of ["crash-after-instruction-registration", "crash-after-admission", "crash-during-approval", "crash-after-completion"]) {
     assert.equal(releaseCases.find((row) => row.id === id)?.owner, "U2/U6");
   }
-  for (const id of ["models-variants", "models-default", "models-reset", "slack-editable-retry-controls"]) assert.ok(releaseCases.find((row) => row.id === id)?.blocked);
+  assert.ok(releaseCases.find((row) => row.id === "slack-editable-retry-controls")?.blocked);
+  for (const id of ["models-switch", "models-variants", "models-default", "models-reset"]) {
+    const definition = releaseCases.find((row) => row.id === id);
+    assert.deepEqual(definition.generations, ["2"]);
+    assert.equal(definition.native, true);
+    assert.equal(definition.blocked, undefined);
+  }
   const workflow = await readFile(new URL("../.github/workflows/opencode-compatibility.yml", import.meta.url), "utf8");
   assert.ok(workflow.includes('- "test/opencode-contract.test.mjs"'));
 });
@@ -114,6 +120,10 @@ async function fixture(t, generation = "v1", options = {}) {
 test("v1 baseline: exact prompt, trusted context and persisted-session continuation", async (t) => {
   const current = await fixture(t);
   const { runtime, document, wire, executor, input } = current;
+  await executor.ready(runtime.workspace);
+  assert.equal(executor.capabilities.liveModelSwitch, false);
+  await assert.rejects(executor.listModels({ workingDirectory: runtime.workspace }), /not supported/u);
+  await assert.rejects(executor.switchModel({ sessionId: input.sessionId, model: null, workingDirectory: runtime.workspace }), /not supported/u);
   const store = await createSessionStore(pipaPaths(runtime.home).sessions);
   await store.set("slack:C1:1.0", document.expected.sessionId);
   const runner = createConversationRunner({ sessionStore: store, runTurn: executor.runTurn, abortTurn: executor.abortTurn });
@@ -135,6 +145,130 @@ test("v1 baseline: exact prompt, trusted context and persisted-session continuat
   assert.equal(wire.calls.filter((call) => call.path === "/session").length, 0, "continuation must not replace the mapped session");
   assert.doesNotMatch(wire.calls.filter((call) => call.path.endsWith("/prompt_async"))[1].body.system, /PIPA_CURRENT_SLACK_CHANNEL_ID=C1/u);
   wire.assertComplete();
+});
+
+test("v2 models: provider-qualified discovery, native default reset and validation before mutation", async (t) => {
+  const { runtime, document, wire, executor, input } = await fixture(t, "v2");
+  const location = { directory: runtime.workspace };
+  const model = { providerID: "connected", id: "shared", name: "Shared", enabled: true, variants: [{ id: "measured" }] };
+  const models = [model, { ...model, providerID: "other" }, { ...model, id: "disabled", enabled: false }];
+  document.routes.push(
+    { method: "GET", path: "/api/model", query: { "location[directory]": runtime.workspace }, repeatLast: true, responses: [{ json: { location, data: models } }] },
+    { method: "GET", path: "/api/model/default", query: { "location[directory]": runtime.workspace }, repeatLast: true, responses: [{ json: { location, data: model } }] },
+    { method: "POST", path: "/api/session/ses_contract/model", repeatLast: true, responses: [{ status: 204 }] },
+  );
+  const catalog = await executor.listModels({ workingDirectory: runtime.workspace });
+  assert.equal(executor.capabilities.liveModelSwitch, true);
+  assert.deepEqual(catalog, { models: ["connected", "other"].map((providerID) => ({ providerID, id: "shared", name: "Shared", variants: ["default", "measured"] })), defaultModel: { providerID: "connected", id: "shared", variant: "default" } });
+  const select = (model) => executor.switchModel({ sessionId: input.sessionId, model, workingDirectory: runtime.workspace });
+  for (const invalid of [{ providerID: "missing", id: "shared" }, { providerID: "connected", id: "disabled" }, { ...model, variant: "absent" }, { ...model, variant: "" }, undefined]) await assert.rejects(select(invalid), /unavailable|Invalid/u);
+  assert.equal(wire.calls.filter((call) => call.method === "POST" && call.path.endsWith("/model")).length, 0);
+  await select({ providerID: "other", id: "shared", variant: "measured" });
+  await select({ providerID: "connected", id: "shared" });
+  await select(null);
+  assert.deepEqual(wire.calls.filter((call) => call.method === "POST" && call.path.endsWith("/model")).map((call) => call.body), [
+    { model: { providerID: "other", id: "shared", variant: "measured" } },
+    { model: { providerID: "connected", id: "shared", variant: "default" } },
+    { model: { providerID: "connected", id: "shared", variant: "default" } },
+  ]);
+  const lookup = document.routes.find((route) => route.path === "/api/session/ses_contract");
+  lookup.responses = [{ json: { data: { id: input.sessionId, location: { directory: path.dirname(runtime.workspace) } } } }];
+  await assert.rejects(select(null), /workspace/u);
+  assert.equal(wire.calls.filter((call) => call.method === "POST" && call.path.endsWith("/model")).length, 3);
+  executor.stopAll();
+  await assert.rejects(select(null), /shutting down/u);
+});
+
+for (const cancellation of ["stop", "caller"]) test(`v2 models: discovery rejects after ${cancellation} cancellation at a fetch barrier`, async (t) => {
+  const reached = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const signals = [];
+  t.after(() => release.resolve());
+  const { runtime, document, executor } = await fixture(t, "v2", { transport: async (url, init, nativeFetch) => {
+    const response = await nativeFetch(url, init);
+    if (["/api/model", "/api/model/default"].includes(new URL(url).pathname)) {
+      signals.push(init.signal);
+      if (signals.length === 2) reached.resolve();
+      // Release a valid response even after cancellation to prove the facade
+      // cannot return success from a transport that already received the body.
+      await release.promise;
+    }
+    return response;
+  } });
+  const model = { providerID: "connected", id: "shared", name: "Shared", enabled: true, variants: [] };
+  for (const [pathname, data] of [["/api/model", [model]], ["/api/model/default", model]]) document.routes.push({
+    method: "GET", path: pathname, query: { "location[directory]": runtime.workspace }, repeatLast: true,
+    responses: [{ json: { location: { directory: runtime.workspace }, data } }],
+  });
+  const controller = new AbortController();
+  const operation = executor.listModels({ workingDirectory: runtime.workspace, ...(cancellation === "caller" ? { signal: controller.signal } : {}) });
+  await reached.promise;
+  if (cancellation === "stop") executor.stopAll();
+  else controller.abort(new Error("cancel model discovery"));
+  const abortedAtBarrier = signals.map((signal) => signal.aborted);
+  release.resolve();
+  await assert.rejects(operation, /shutting down|cancel model discovery/u);
+  assert.deepEqual(abortedAtBarrier, [true, true], "Cancellation must abort both native discovery requests");
+});
+
+for (const method of ["listModels", "switchModel"]) test(`v2 models: ${method} aborts its pending sibling read on discovery failure`, async (t) => {
+  const reached = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  let pendingSignal;
+  const failureBody = { _tag: "UnauthorizedError", message: "Discovery HTTP 401" };
+  const failure = new Response(JSON.stringify(failureBody), { status: 401, headers: { "content-type": "application/json" } });
+  t.after(() => release.resolve());
+  const { runtime, executor, input, wire } = await fixture(t, "v2", { transport: async (url, init, nativeFetch) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/api/model") {
+      await reached.promise;
+      return failure;
+    }
+    if (pathname === "/api/model/default") {
+      pendingSignal = init.signal;
+      reached.resolve();
+      await Promise.race([release.promise, new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }))]);
+      return new Response(JSON.stringify({ location: { directory: runtime.workspace }, data: null }), { headers: { "content-type": "application/json" } });
+    }
+    return nativeFetch(url, init);
+  } });
+  await assert.rejects(executor[method]({ ...input, model: null }), (error) => {
+    assert.equal(error._tag, failureBody._tag);
+    assert.equal(error.message, failureBody.message, "The discovery failure must remain the original HTTP 401");
+    return true;
+  });
+  assert.equal(pendingSignal.aborted, true, "Operation settlement must abort the pending sibling before unregistering");
+  assert.ok(!wire.calls.some((call) => call.method !== "GET"), "Failed discovery must not mutate the session");
+});
+
+for (const failure of ["no-default", "wrong-location", "missing-session", "cancel", "stop"]) test(`v2 models: ${failure} prevents native mutation and replacement`, async (t) => {
+  const reached = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const { runtime, document, executor, input, wire } = await fixture(t, "v2", { transport: async (url, init, nativeFetch) => {
+    if (new URL(url).pathname === "/api/model" && ["cancel", "stop"].includes(failure)) {
+      reached.resolve();
+      await release.promise;
+    }
+    return nativeFetch(url, init);
+  } });
+  const model = { providerID: "connected", id: "shared", name: "Shared", enabled: true, variants: [] };
+  const location = { directory: failure === "wrong-location" ? path.dirname(runtime.workspace) : runtime.workspace };
+  document.routes.push(
+    { method: "GET", path: "/api/model", query: { "location[directory]": runtime.workspace }, repeatLast: true, responses: [{ json: { location, data: [model] } }] },
+    { method: "GET", path: "/api/model/default", query: { "location[directory]": runtime.workspace }, repeatLast: true, responses: [{ json: { location, data: failure === "no-default" ? null : model } }] },
+  );
+  if (failure === "missing-session") document.routes.find((route) => route.path === "/api/session/ses_contract").responses = [{ status: 404, json: { _tag: "SessionNotFoundError", sessionID: input.sessionId } }];
+  const controller = new AbortController();
+  const operation = executor.switchModel({ sessionId: input.sessionId, model: null, workingDirectory: runtime.workspace, signal: controller.signal });
+  if (["cancel", "stop"].includes(failure)) {
+    await reached.promise;
+    if (failure === "stop") executor.stopAll();
+    else controller.abort(new Error("cancel model selection"));
+    release.resolve();
+  }
+  await assert.rejects(operation, /unavailable|workspace|cancel model|shutting down/u);
+  assert.ok(!wire.calls.some((call) => call.method !== "GET"), "A rejected selection must make no native mutation");
+  assert.equal(await readFile(pipaPaths(runtime.home).openCodeRecovery, "utf8").catch((error) => error.code), "ENOENT", "Selection must not create a preference/recovery record");
 });
 
 test("v1 baseline: subscription, duplicate question suppression and linked child permission", async (t) => {
@@ -1426,6 +1560,8 @@ for (const confirmation of ["refused", "timeout", "healthy"]) test(`v2 fallback:
   assert.equal(JSON.parse(await readFile(pipaPaths(runtime.home).openCodeRecovery, "utf8")).records.length, 1);
   await assert.rejects(executor.runTurn(input), /blocked/u);
   assert.equal(fatal.length, confirmation === "healthy" ? 0 : 1);
+  await assert.rejects(executor.listModels({ workingDirectory: input.workingDirectory }), /blocked/u);
+  await assert.rejects(executor.switchModel({ ...input, model: null }), /blocked/u);
   wire.assertComplete();
 });
 

@@ -61,7 +61,7 @@ export const releaseCases = [
   caseOf("background-child", "Native background subagents", "Advertised native background task returns its child nonce through production executor", "U4"),
   caseOf("background-result-attribution", "Native background subagents", "Preserve v1 foreground completion while background work is pending; child result returns to parent history without new Pipa delivery policy", "U4"),
   caseOf("models-switch", "Models/providers", "Production model discovery/switch seam retains history and changes the next provider request", "U5", { native: true, generations: ["2"] }),
-  ...["variants", "default", "reset"].map((kind) => caseOf(`models-${kind}`, "Models/providers", `Native ${kind} semantics preserve history and prove the next provider request`, "U5", { blocked: `No qualified public production ${kind} seam/request contract; model switching alone does not prove ${kind} semantics (U5)` })),
+  ...["variants", "default", "reset"].map((kind) => caseOf(`models-${kind}`, "Models/providers", `Native ${kind} semantics preserve history and prove the next provider request`, "U5", { native: true, generations: ["2"] })),
   caseOf("definitions-mcp-skill", "MCP/skills/agents/commands/plugins", "Invoke real stdio MCP and file skill through actual native tools; plugin loads", "U7"),
   caseOf("definitions-command", "MCP/skills/agents/commands/plugins", "Production tool path invokes the installed native CLI file command and returns its result", "U7"),
   caseOf("migration-seed", "Package/platform/rollback", "Generate synthetic v1 histories/mappings/routines/approval; stop all writers and checkpoint-copy", "U9", transitionCase),
@@ -259,10 +259,19 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
   const provider = await createProvider(runtime);
   const definitions = await writeDefinitions(runtime, `DEFINITION_${randomUUID()}`);
   const engineConfig = { ...providerConfig(provider.url), mcp: definitions.mcp, plugin: definitions.plugin };
+  if (pin.startsWith("2.") && (!caseIds || caseIds.some((id) => id.startsWith("models-")))) {
+    const modelProvider = (id) => ({ package: "@opencode/ai/providers/openai-compatible", settings: { baseURL: provider.url, apiKey: "synthetic-local-only" }, headers: { "x-matrix-provider": id }, models: {
+      matrix: { variants: [{ id: "measured", body: { temperature: 0.37 } }], limit: { context: 64000, output: 8000 } },
+      "matrix-next": { limit: { context: 64000, output: 8000 } }, disabled: { disabled: true },
+    } });
+    engineConfig.enabled_providers = ["matrix", "other"];
+    engineConfig.providers = { matrix: modelProvider("matrix"), other: modelProvider("other"), excluded: modelProvider("excluded") };
+  }
   // Exact-size plaintext attachment qualification must not hit this finite
   // provider fixture's ordinary 64k context and enter compaction before inference.
   if (!caseIds || caseIds.includes("attachment-10mib")) {
     for (const model of Object.values(engineConfig.provider.matrix.models)) model.limit.context = 16_000_000;
+    for (const model of Object.values(engineConfig.providers?.matrix.models ?? {})) if (model.limit) model.limit.context = 16_000_000;
   }
   await writeFile(runtime.env.OPENCODE_CONFIG, JSON.stringify(engineConfig));
   const headers = { authorization: `Basic ${Buffer.from("opencode:synthetic-loopback-only").toString("base64")}` };
@@ -303,7 +312,7 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
         assert.ok(uri?.startsWith("data:") || uri?.startsWith("file:"), "Unsupported native attachment transport");
         return { filename: part.filename ?? part.name, transport: uri.startsWith("data:") ? "data-uri" : "local", base64: uri.startsWith("data:") ? uri.split(",")[1] : (await readFile(new URL(uri))).toString("base64") };
       }));
-      wires.push({ path: new URL(address).pathname, body, files });
+      wires.push({ method: init.method ?? request?.method ?? "GET", path: new URL(address).pathname, body, files });
     }
     const eventConnection = disconnectEvents && new URL(address).pathname.endsWith("/event") ? new AbortController() : null;
     const signal = init.signal ?? request?.signal;
@@ -709,12 +718,76 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
       if (requireExecutor()) return requireExecutor();
       if (typeof executor.listModels !== "function" || typeof executor.switchModel !== "function") return { status: "BLOCKED", observed: `Installed production facade exposes ${Object.keys(executor).join(", ")}; native model discovery/switch seam absent` };
       const models = await executor.listModels({ workingDirectory: runtime.workspace });
-      assert.ok(JSON.stringify(models).includes("matrix-next"));
+      assert.equal(executor.capabilities.liveModelSwitch, true);
+      assert.deepEqual(models.models.map(({ providerID, id }) => `${providerID}/${id}`).sort(), ["matrix/matrix", "matrix/matrix-next", "other/matrix", "other/matrix-next"]);
+      assert.ok(!JSON.stringify(models).includes("synthetic-local-only"), "Discovery exposed provider credentials");
+      cell.evidence.modelCatalog = models;
       const first = await turn("model-first");
+      const get = async () => {
+        const response = await connectedFetch(`${baseUrl}/api/session/${first.sessionId}`, { headers });
+        assert.equal(response.status, 200);
+        return response.json();
+      };
+      const before = await get();
+      const writesBefore = wires.filter((wire) => wire.method === "POST" && wire.path.endsWith("/model")).length;
+      for (const model of [{ providerID: "absent", id: "matrix" }, { providerID: "excluded", id: "matrix" }, { providerID: "matrix", id: "disabled" }, { providerID: "matrix", id: "matrix", variant: "absent" }]) {
+        await assert.rejects(executor.switchModel({ sessionId: first.sessionId, model, workingDirectory: runtime.workspace }), /unavailable/u);
+        assert.deepEqual(await get(), before, "Unavailable selection mutated the native session");
+      }
+      assert.equal(wires.filter((wire) => wire.method === "POST" && wire.path.endsWith("/model")).length, writesBefore);
       await executor.switchModel({ sessionId: first.sessionId, model: { providerID: "matrix", id: "matrix-next" }, workingDirectory: runtime.workspace });
       const next = await turn("model-next", { sessionId: first.sessionId }, { verify: (messages) => assert.ok(JSON.stringify(messages).includes(promptFor("model-first"))) });
       assertTurnOutcome(next, { sessionId: first.sessionId, text: textFor("model-next") });
       assert.equal(provider.receipts.find((receipt) => receipt.prompt === promptFor("model-next")).model, "matrix-next");
+      await executor.switchModel({ sessionId: first.sessionId, model: { providerID: "other", id: "matrix" }, workingDirectory: runtime.workspace });
+      await turn("model-other", { sessionId: first.sessionId });
+      assert.equal(provider.receipts.find((receipt) => receipt.prompt === promptFor("model-other")).provider, "other");
+      const running = turn("model-inflight", { sessionId: first.sessionId, onInteraction: () => ({ type: "answer", answers: [["Yes"]] }) }, {
+        hold: true, holdOnce: true, tool: { names: ["question"], arguments: () => ({ questions: [{ header: "Timing", question: "Continue?", options: [{ label: "Yes", description: "Continue" }] }] }) },
+      });
+      // An already-issued request stays on the old provider; the next tool-loop
+      // provider step in this same Pipa turn must use the new native selection.
+      try {
+        await runtime.waitFor(() => provider.receipts.find((receipt) => receipt.prompt === promptFor("model-inflight")), { label: "held provider step" });
+        await executor.switchModel({ sessionId: first.sessionId, model: { providerID: "matrix", id: "matrix-next" }, workingDirectory: runtime.workspace });
+      } finally { provider.release(promptFor("model-inflight")); }
+      assertTurnOutcome(await running, { sessionId: first.sessionId, text: textFor("model-inflight") });
+      const steps = provider.receipts.filter((receipt) => receipt.prompt === promptFor("model-inflight"));
+      assert.deepEqual(steps.map(({ provider, model }) => [provider, model]), [["other", "matrix"], ["matrix", "matrix-next"]]);
+      cell.evidence.modelTiming = { sessionId: first.sessionId, providerSteps: steps.map(({ provider, model }) => ({ provider, model })) };
+    },
+    "models-variants": async () => {
+      if (requireExecutor()) return requireExecutor();
+      const first = await turn("variant-first");
+      await executor.switchModel({ sessionId: first.sessionId, model: { providerID: "matrix", id: "matrix", variant: "measured" }, workingDirectory: runtime.workspace });
+      const next = await turn("variant-measured", { sessionId: first.sessionId }, { verify: (messages) => assert.ok(JSON.stringify(messages).includes(promptFor("variant-first"))) });
+      assertTurnOutcome(next, { sessionId: first.sessionId, text: textFor("variant-measured") });
+      assert.equal(provider.receipts.find((receipt) => receipt.prompt === promptFor("variant-measured")).temperature, 0.37);
+      for (const [suffix, model] of [["omitted", { providerID: "matrix", id: "matrix" }], ["explicit", { providerID: "matrix", id: "matrix", variant: "default" }]]) {
+        await executor.switchModel({ sessionId: first.sessionId, model, workingDirectory: runtime.workspace });
+        await turn(`variant-${suffix}`, { sessionId: first.sessionId });
+        assert.equal(provider.receipts.find((receipt) => receipt.prompt === promptFor(`variant-${suffix}`)).temperature, undefined);
+      }
+    },
+    "models-default": async () => {
+      if (requireExecutor()) return requireExecutor();
+      const catalog = await executor.listModels({ workingDirectory: runtime.workspace });
+      assert.deepEqual(catalog.defaultModel, { providerID: "matrix", id: "matrix", variant: "default" });
+      await turn("model-default");
+      const receipt = provider.receipts.find((receipt) => receipt.prompt === promptFor("model-default"));
+      assert.deepEqual([receipt.provider, receipt.model, receipt.temperature], ["matrix", "matrix", undefined]);
+    },
+    "models-reset": async () => {
+      if (requireExecutor()) return requireExecutor();
+      const first = await turn("reset-first");
+      await executor.switchModel({ sessionId: first.sessionId, model: { providerID: "other", id: "matrix", variant: "measured" }, workingDirectory: runtime.workspace });
+      await turn("reset-selected", { sessionId: first.sessionId });
+      await executor.switchModel({ sessionId: first.sessionId, model: null, workingDirectory: runtime.workspace });
+      await turn("reset-default", { sessionId: first.sessionId }, { verify: (messages) => assert.ok(JSON.stringify(messages).includes(promptFor("reset-first"))) });
+      const selected = provider.receipts.find((receipt) => receipt.prompt === promptFor("reset-selected"));
+      const reset = provider.receipts.find((receipt) => receipt.prompt === promptFor("reset-default"));
+      assert.deepEqual([selected.provider, selected.temperature, reset.provider, reset.model, reset.temperature], ["other", 0.37, "matrix", "matrix", undefined]);
+      cell.evidence.modelReset = "Resolve native model.default at request time and explicitly switch to its default variant; native 2.0.29 rejects null and has no clear-override operation";
     },
     "failed-turn": async () => {
       if (requireExecutor()) return requireExecutor();
@@ -1233,14 +1306,17 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
     const selectedCases = caseIds ? releaseCases.filter((row) => caseIds.includes(row.id)) : releaseCases;
     for (const definition of [...selectedCases.filter((row) => row.id !== "stop-ownership"), ...selectedCases.filter((row) => row.id === "stop-ownership")]) {
       await recordCase(cell.cases, definition, async () => {
-        if (definition.id === "models-switch" && !pin.startsWith("2.")) return { status: "NOT_APPLICABLE", observed: "Native v1 has no live v2 HTTP switch operation; ordinary model execution is covered separately" };
+        if (definition.id.startsWith("models-") && !pin.startsWith("2.")) {
+          assert.equal(executor.capabilities.liveModelSwitch, false);
+          return { status: "NOT_APPLICABLE", observed: "Native v1 has no live v2 HTTP switch operation; ordinary model execution is covered separately" };
+        }
         if (definition.blocked) return { status: "BLOCKED", observed: definition.blocked };
         const checkpoint = provider.checkpoint();
         try { return await execute[definition.id](); }
         finally { provider.assertClean(checkpoint); }
       });
     }
-    cell.evidence.provider = provider.receipts.map((receipt) => ({ prompt: receipt.prompt, model: receipt.model, toolNames: receipt.tools.map((tool) => tool.name), toolResultCount: receipt.toolResults.length, cancelledConnection: receipt.closed && !receipt.released }));
+    cell.evidence.provider = provider.receipts.map((receipt) => ({ prompt: receipt.prompt, model: receipt.model, provider: receipt.provider, temperature: receipt.temperature, toolNames: receipt.tools.map((tool) => tool.name), toolResultCount: receipt.toolResults.length, cancelledConnection: receipt.closed && !receipt.released }));
     cell.evidence.admissions = wires.filter((wire) => wire.body.text || wire.body.parts).map((wire) => ({ path: wire.path, prompt: wire.body.text ?? wire.body.parts[0]?.text, files: wire.files.map((file) => ({ filename: file.filename, sha256: createHash("sha256").update(Buffer.from(file.base64, "base64")).digest("hex") })) }));
     if (migration) {
       const manifest = JSON.parse(await readFile(new URL("../../test/fixtures/opencode-migration/manifest.json", import.meta.url), "utf8"));
