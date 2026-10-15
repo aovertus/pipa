@@ -19,7 +19,7 @@ const liveCase = { lane: "live" };
 const transitionCase = { native: true, generations: ["1"] };
 const caseOf = (id, feature, expected, owner, extra = {}) => ({ id, feature, expected, owner, lane: "deterministic", modes: ["socket-owned", "attached", "managed"], generations: ["1", "2"], required: true, ...extra });
 export const releaseCases = [
-  caseOf("package-cli", "Init/config/version/help", "Installed version/help and side-effect-free routine preview", "U9"),
+  caseOf("package-cli", "Init/config/version/help", "Installed version/help and side-effect-free routine preview", "U6/U9"),
   caseOf("init-identity", "Init/config/version/help", "Fresh initialization accepts the real engine identity without overwriting invalid profiles", "U1"),
   caseOf("startup-readiness", "Socket startup/stop; Managed startup/stop; Attached server", "Authenticated production workspace readiness and correct ownership", "U1"),
   caseOf("exact-prompt-continuation", "New conversation/history", "Exact prompt bytes, final text and same session/history on the installed facade", "U2"),
@@ -37,6 +37,7 @@ export const releaseCases = [
   caseOf("routine-revocation", "Routine continuation/access", "Revoke destination at held provider barrier; no stale delivery", "U4", chatCase),
   caseOf("stop-ownership", "Socket startup/stop; Managed startup/stop; Attached server", "Reject new work; owned port closes, attached PID/port survive Pipa shutdown", "U1"),
   caseOf("managed-restart", "Detached restart, Managed/failures", "Actual CLI replacement PID/generation becomes ready, old process exits, durable completion and follow-up", "U6", managedCase),
+  caseOf("socket-fixture-restart", "Detached restart, Socket/attached", "Installed CLI detached restart with fake Chat: native readiness, worker exit, one routed notice, history follow-up and attached PID survival", "U6", chatCase),
   caseOf("reconnect-stream", "Reconnect/reload", "Close a real production event response, reconnect, settle one permission and deliver once", "U2/U3", chatCase),
   caseOf("reload-location", "Reconnect/reload", "Native location reload preserves session history and admits exactly one continuation", "U2/U3"),
   caseOf("crash-after-instruction-registration", "Abrupt crash/recovery", "Death after owned instruction registration recovers only Pipa-owned context without admitting new work", "U2/U6"),
@@ -83,6 +84,38 @@ export function isNativeAdmission(wire, prompt) {
 
 export function assertNativeAdmissionCount(wires, prompt, expected) {
   assert.equal(wires.filter((wire) => isNativeAdmission(wire, prompt)).length, expected, `Native admission count for ${prompt}`);
+}
+
+// Observe the installed process's real fetch boundary without replacing requests
+// or responses. Retain synthetic prompt receipts only, never headers/config.
+export function observeNativeAdmissions(fetchImpl, admissions) {
+  return async (url, init) => {
+    const request = url instanceof Request ? url : null;
+    const pathname = new URL(request?.url ?? String(url)).pathname;
+    const method = init?.method ?? request?.method ?? "GET";
+    let receipt;
+    if (method === "POST" && /\/session\/[^/]+\/prompt(?:_async)?$/u.test(pathname)) {
+      const body = JSON.parse(init?.body ?? await request.clone().text());
+      const prompt = body.text ?? body.parts?.find((part) => part.type === "text")?.text;
+      assert.equal(typeof prompt, "string", "Native admission prompt missing");
+      receipt = { method, path: pathname, prompt };
+    }
+    const response = await fetchImpl(url, init);
+    if (receipt) admissions.push({ ...receipt, status: response.status });
+    return response;
+  };
+}
+
+export function assertRestartRoutineAdmission(snapshot, { pid, prompt, marker, sessionId }) {
+  assert.equal(snapshot.pid, pid, "Routine receipt must come from the replacement process");
+  const matches = snapshot.admissions.filter((item) => item.prompt.includes(marker));
+  assert.equal(matches.length, 1, "Expected exactly one nonce-owned routine native prompt admission");
+  const receipt = matches[0];
+  assert.equal(receipt.method, "POST");
+  assert.equal(receipt.path.match(/\/session\/([^/]+)\/prompt(?:_async)?$/u)?.[1], sessionId, "Routine native admission session must match its delivered result mapping");
+  assert.ok(receipt.status >= 200 && receipt.status < 300, "Routine native admission must be accepted");
+  assertPromptReceipt({ prompt: receipt.prompt, context: {} }, { prompt, context: {} });
+  return receipt;
 }
 
 // Kill only a private Pipa runner/executor process. The actual attached engine
@@ -172,7 +205,7 @@ function png() {
   return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk("IHDR", header), chunk("IDAT", deflateSync(Buffer.from([0, 255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 0, 255, 255, 255, 255, 255, 255]))), chunk("IEND", Buffer.alloc(0))]);
 }
 
-function fakeChat() {
+export function fakeChat() {
   const threads = new Map();
   const posts = [];
   const controls = [];
@@ -386,6 +419,10 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
     try { return await selectedExecutor.runTurn({ prompt, workingDirectory: runtime.workspace, signal: controller.signal, ...input, onSession: async (id) => { session = id; await input.onSession?.(id); } }); }
     finally { clearTimeout(timer); if (controller.signal.aborted && session) await selectedExecutor.abortTurn(session); }
   };
+  const environmentTool = (marker) => ({ names: ["bash", "shell", "$shell"], arguments: () => ({
+    command: `"${process.execPath}" -e "if(process.env.PIPA_INTEGRATION_SENTINEL!=='matrix-integration'||Object.keys(process.env).some(k=>/(?:^|_)SLACK.*(?:TOKEN|SECRET)$/i.test(k)))process.exit(23);console.log('${marker}')"`,
+    description: "Verify inherited integration environment and excluded Slack credentials after restart",
+  }), verify: (results) => assert.ok(JSON.stringify(results).includes(marker), "Replacement tool environment check did not execute") });
   const waitMessage = async (message, label = "Chat turn settlement") => runtime.waitFor(() => chat.reactions.some((item) => item.message === message.id && !item.added), { timeoutMs: 15_000, label });
   const send = async (id, thread, mention = true) => {
     provider.register({ prompt: promptFor(id), text: textFor(id) });
@@ -1165,9 +1202,123 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
       assert.deepEqual(await state.readInstanceLock(paths.lock), replacement);
       assert.equal(JSON.parse(await runCli("restart", "--status")).state, "completed");
       cell.evidence.restart = { requestId: outcome.id, old, replacement, workerPids: [...workerPids], workersExited: true, durableState: outcome.state, lifecycleStatus: "PASS", followupStatus: "FAIL" };
-      const result = await turn("after-restart");
+      const result = await turn("after-restart", { onInteraction: async () => ({ type: "reply", reply: "once" }) }, { tool: environmentTool(textFor("after-restart")) });
       assertTurnOutcome(result, { sessionId: result.sessionId, text: textFor("after-restart") });
       cell.evidence.restart.followupStatus = "PASS";
+    },
+    "socket-fixture-restart": async () => {
+      if (requireApp()) return requireApp();
+      // Stop the in-process app before exercising the real installed CLI. Only
+      // Chat/auth are injected; CLI, watcher, worker, facade and engine are real.
+      await app.shutdown();
+      const probe = await createRuntimeFixture({ timeoutMs: 90000, parent: runtime });
+      runtime.defer(() => probe.teardown(), "Socket CLI fixture resources");
+      Object.assign(probe.env, runtime.env, {
+        ...Object.fromEntries(Object.entries(probe.env).filter(([key]) => key !== "PATH")),
+        OPENCODE_CONFIG: runtime.env.OPENCODE_CONFIG,
+        NODE_OPTIONS: `--import=${new URL("./socket-cli-fixture.mjs", import.meta.url).href}`,
+        PIPA_FIXTURE_CANDIDATE: candidate,
+        PIPA_INTEGRATION_SENTINEL: "matrix-integration",
+        PIPA_SLACK_BOT_TOKEN: "xoxb-forbidden-child-marker",
+        Slack_Client_Secret: "forbidden-child-marker",
+        ...(mode === "attached" ? { PIPA_OPENCODE_ATTACH_URL: baseUrl } : {}),
+      });
+      if (mode !== "attached") delete probe.env.PIPA_OPENCODE_ATTACH_URL;
+      const probePaths = state.pipaPaths(probe.home);
+      const probeConfig = { ...config, workingDirectory: probe.workspace };
+      // Attached workspace is checked against the independent engine, not a new
+      // fixture workspace. Its database/process remains owned by the outer cell.
+      if (mode === "attached") probeConfig.workingDirectory = runtime.workspace;
+      await state.writePrivateJson(probePaths.config, probeConfig);
+      const snapshot = () => readFile(path.join(probe.state, "chat.json"), "utf8").then(JSON.parse).catch(() => null);
+      let identity;
+      const original = probe.spawn(process.execPath, [cli, "start"]);
+      const invoke = (...args) => command(probe, process.execPath, [cli, ...args]);
+      probe.defer(async () => {
+        const lock = await state.readInstanceLock(probePaths.lock);
+        if (lock) process.kill(lock.pid, "SIGTERM");
+        await waitFor(async () => !await state.readInstanceLock(probePaths.lock), { timeoutMs: 8000, label: "Socket CLI lock release" });
+        if (identity) await waitFor(() => !state.isRunning(identity.pid), { timeoutMs: 5000, label: "Socket replacement exit" });
+      }, "Socket CLI replacement and lock");
+      try {
+        await probe.waitFor(async () => (await snapshot())?.ready, { timeoutMs: 20000, label: "Socket native and Chat startup" });
+        const old = await state.readInstanceLock(probePaths.lock);
+        assert.equal(old.pid, original.child.pid);
+        const thread = "slack:CMATRIX:777.001";
+        const prompt = promptFor("socket-before-restart");
+        provider.register({ prompt, text: textFor("socket-before-restart") });
+        await state.writePrivateJson(path.join(probe.state, "input.json"), { id: "before", thread, prompt });
+        await probe.waitFor(async () => (await snapshot())?.posts.some((post) => post.content?.markdown === textFor("socket-before-restart")), { timeoutMs: 15000, label: "Socket pre-restart turn" });
+        const sessionId = JSON.parse(await readFile(probePaths.sessions, "utf8"))[thread];
+        assert.ok(sessionId);
+        const routinePrompt = `  ${promptFor("socket-restart-routine")}\nexact saved prompt  \n`;
+        provider.register({ prompt: promptFor("socket-restart-routine"), text: textFor("socket-restart-routine") });
+        const created = JSON.parse(await invoke("routine", "create", "--prompt", routinePrompt, "--timezone", "UTC", "--channel", "CMATRIX", "--thread", "777.001", "--at", new Date(Date.now() + 60000).toISOString(), "--json"));
+        await invoke("routine", "edit", created.routine.id, "--status", "inactive", "--json");
+        const requested = await Promise.all(Array.from({ length: 2 }, () => invoke("restart", "--channel", "CMATRIX", "--thread", "777.001")));
+        assert.ok(requested.every((output) => output.includes(old.generation) && !output.includes("completed")));
+        const workerPids = new Set();
+        const outcome = await probe.waitFor(async () => {
+          for (const pid of await observeWorker(old.generation)) workerPids.add(pid);
+          const status = await restart.restartStatus({ home: probe.home });
+          assert.ok(!["failed", "unconfirmed"].includes(status?.state), JSON.stringify(status));
+          return status?.state === "completed" && status;
+        }, { timeoutMs: 45000, label: "external Socket CLI restart observer" });
+        identity = outcome.replacement;
+        assert.notEqual(identity.pid, old.pid);
+        assert.notEqual(identity.generation, old.generation);
+        assert.equal((await bounded(original.exited, { timeoutMs: 5000 })).code, 0);
+        assert.ok(workerPids.size);
+        await probe.waitFor(() => [...workerPids].every((pid) => !state.isRunning(pid)), { timeoutMs: 5000, label: "Socket restart worker exit" });
+        await probe.waitFor(async () => (await snapshot())?.posts.some((post) => post.content === "Matrix restarted and is ready."), { timeoutMs: 5000, label: "routed ready notice" });
+        const afterPrompt = promptFor("socket-after-restart");
+        provider.register({ prompt: afterPrompt, text: textFor("socket-after-restart"), tool: environmentTool(textFor("socket-after-restart")), verify: (messages) => assert.ok(JSON.stringify(messages).includes(prompt), "Restart lost session history") });
+        await state.writePrivateJson(path.join(probe.state, "input.json"), { id: "after", thread, prompt: afterPrompt, mention: false });
+        const control = await probe.waitFor(async () => (await snapshot())?.controls.find((item) => item.thread === thread), { timeoutMs: 15000, label: "replacement native tool approval" });
+        const action = control.blocks.flatMap((block) => block.elements ?? []).find((item) => item.action_id.startsWith("pipa_permission_once_"));
+        assert.ok(action);
+        await state.writePrivateJson(path.join(probe.state, "input.json"), { id: "approve", action: { actionId: action.action_id, value: action.value, threadId: thread, user: { userId: "UMATRIX" } } });
+        const observed = await probe.waitFor(async () => {
+          const value = await snapshot();
+          return value?.pid === identity.pid && value.posts.some((post) => post.content?.markdown === textFor("socket-after-restart")) && value;
+        }, { timeoutMs: 15000, label: "Socket replacement follow-up" });
+        const notices = observed.posts.filter((post) => post.content === "Matrix restarted and is ready.");
+        assert.equal(notices.length, 1);
+        assert.equal(notices[0].thread, thread);
+        assert.equal(JSON.parse(await readFile(probePaths.sessions, "utf8"))[thread], sessionId);
+        assert.deepEqual(await state.readInstanceLock(probePaths.lock), identity);
+        const retained = JSON.parse(await invoke("routine", "show", created.routine.id, "--json")).routine;
+        assert.equal(retained.prompt, routinePrompt);
+        assert.equal(retained.status, "inactive");
+        await invoke("routine", "edit", created.routine.id, "--status", "active", "--at", new Date(Date.now() + 1500).toISOString(), "--json");
+        const completed = await probe.waitFor(async () => {
+          const item = (await routines.loadRoutineState(probePaths.routines)).routines.find((item) => item.id === created.routine.id);
+          if (item?.lastRun && item.lastRun.status !== "succeeded") assert.fail(JSON.stringify(item.lastRun));
+          return item?.status === "completed" && item;
+        }, { timeoutMs: 15000, label: "replacement scheduler dispatch" });
+        assert.equal(completed.lastRun.trigger, "scheduled");
+        assert.equal(completed.runRequestedAt, null);
+        await state.writePrivateJson(path.join(probe.state, "input.json"), { id: "scheduler-barrier", barrier: true });
+        const reconciled = await probe.waitFor(async () => {
+          const value = await snapshot();
+          return value?.schedulerBarriers > 0 && value;
+        }, { timeoutMs: 5000, label: "replacement scheduler reconciliation" });
+        const results = reconciled.posts.filter((post) => post.content?.markdown === textFor("socket-restart-routine"));
+        assert.equal(results.length, 1);
+        assert.equal(results[0].thread, thread);
+        const routineSessionId = JSON.parse(await readFile(probePaths.sessions, "utf8"))[thread];
+        assert.ok(routineSessionId);
+        const nativeAdmission = assertRestartRoutineAdmission(reconciled, { pid: identity.pid, prompt: routinePrompt, marker: promptFor("socket-restart-routine"), sessionId: routineSessionId });
+        await invoke("routine", "delete", created.routine.id, "--json");
+        await invoke("stop");
+        await probe.waitFor(async () => !await state.readInstanceLock(probePaths.lock), { timeoutMs: 8000, label: "Socket stop lock" });
+        await probe.waitFor(() => !state.isRunning(identity.pid), { timeoutMs: 5000, label: "Socket stopped replacement" });
+        if (mode === "attached") {
+          assert.equal(independent.child.exitCode, null);
+          await health();
+        } else await probe.waitFor(() => fetch(observed.nativeUrl, { signal: AbortSignal.timeout(500) }).then(() => false, () => true), { timeoutMs: 5000, label: "Socket replacement owned port close" });
+        cell.evidence.socketFixtureRestart = { requestId: outcome.id, old, replacement: identity, workerPids: [...workerPids], workersExited: true, sessionId, readyNotices: notices.length, routine: { id: created.routine.id, trigger: completed.lastRun.trigger, resultCount: results.length, reconciliations: 2, nativeAdmission }, attachedPid: mode === "attached" ? independent.child.pid : null, transport: "fake Chat/auth; actual installed CLI and native engine; not live Slack" };
+      } finally { await probe.teardown(); await startApp(); }
     },
   };
   async function schedulerBarrier(label) {

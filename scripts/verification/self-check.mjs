@@ -5,7 +5,7 @@ import path from "node:path";
 import { createRuntimeFixture, waitFor, FIXTURE_TEARDOWN_TIMEOUT_MS } from "../../test/helpers/runtime-fixture.mjs";
 import { assertTurnOutcome } from "../../test/helpers/opencode-contract.mjs";
 import { assertPin, compatibilityExit, selectGate, recordCase, finishCell, CELL_WORKER_TIMEOUT_MS, PINS, MODES } from "../test-opencode-matrix.mjs";
-import { observeRuntimeReadiness, releaseCases, runCell } from "./opencode-release-cases.mjs";
+import { observeRuntimeReadiness, observeNativeAdmissions, assertRestartRoutineAdmission, releaseCases, runCell } from "./opencode-release-cases.mjs";
 import { checkOpenCodeConnection } from "../../src/opencode.mjs";
 import { createWireFixture, loadWireFixture } from "../../test/helpers/opencode-contract.mjs";
 import { createProvider } from "./opencode-provider.mjs";
@@ -14,6 +14,35 @@ import { fileURLToPath } from "node:url";
 import { journal, windowsTree } from "../../test/helpers/runtime-ownership.mjs";
 
 const facade = { checkOpenCodeConnection };
+
+test("restarted native routine receipts reject trimmed/mutated prompt bytes and wrong attribution", async () => {
+  const prompt = "  MATRIX_routine_nonce\nexact saved prompt  \n";
+  for (const version of [1, 2]) {
+    const admissions = [];
+    const response = Response.json({}, { status: 202 });
+    const observed = observeNativeAdmissions(async (request, init) => {
+      assert.equal(await request.clone().text(), JSON.stringify(version === 1 ? { parts: [{ type: "text", text: prompt }] } : { text: prompt }));
+      assert.equal(init, undefined);
+      return response;
+    }, admissions);
+    const request = new Request(`http://127.0.0.1:4096/${version === 2 ? "api/" : ""}session/ses_routine/${version === 1 ? "prompt_async" : "prompt"}`, {
+      method: "POST", headers: { authorization: "Basic private-marker" },
+      body: JSON.stringify(version === 1 ? { parts: [{ type: "text", text: prompt }] } : { text: prompt }),
+    });
+    assert.equal(await observed(request), response, "Observer must return the real response unchanged");
+    assert.doesNotMatch(JSON.stringify(admissions), /authorization|private-marker|127\.0\.0\.1/iu);
+    const snapshot = { pid: 42, admissions };
+    const expected = { pid: 42, prompt, marker: "MATRIX_routine_nonce", sessionId: "ses_routine" };
+    assertRestartRoutineAdmission(snapshot, expected);
+    for (const mutation of [prompt.trim(), prompt.replace("exact saved", "changed saved")]) {
+      assert.throws(() => assertRestartRoutineAdmission({ ...snapshot, admissions: [{ ...admissions[0], prompt: mutation }] }, expected), /prompt/iu);
+    }
+    for (const mutate of [value => { value.pid = 99; }, value => { value.admissions[0].path = "/session/ses_other/prompt"; }, value => { value.admissions[0].status = 401; }, value => { value.admissions.push(value.admissions[0]); }]) {
+      const changed = structuredClone(snapshot); mutate(changed);
+      assert.throws(() => assertRestartRoutineAdmission(changed, expected));
+    }
+  }
+});
 
 test("wrong reported pin fails, including prefixed output", () => {
   assertPin("OpenCode 2.0.29", "2.0.29");
@@ -78,7 +107,7 @@ test("declarative gates select applicable cases across every mode and generation
   assert.equal(selected.gate, "deterministic");
   assert.equal(selected.exitCode, 0);
   for (const engine of PINS) {
-    for (const id of ["chat-continuation", "questions-permissions-tools", "routine-once", "reconnect-stream"]) {
+    for (const id of ["chat-continuation", "questions-permissions-tools", "routine-once", "reconnect-stream", "socket-fixture-restart"]) {
       assert.ok(selected.excluded.some((entry) => entry.engine === engine && entry.mode === "managed" && entry.id === id));
       for (const mode of ["socket-owned", "attached"]) assert.ok(selected.included.some((entry) => entry.engine === engine && entry.mode === mode && entry.id === id));
     }
@@ -109,7 +138,7 @@ test("required deterministic defects, missing cases/cells, diagnostics and empty
   for (const engine of PINS) for (const mode of MODES) for (const status of ["FAIL", "BLOCKED", "NOT_APPLICABLE"]) {
     const report = gateFixture();
     const cell = report.cells.find((cell) => cell.engine === engine && cell.mode === mode);
-    for (const id of ["exact-prompt-continuation", "crash-after-instruction-registration", "crash-after-admission", "crash-during-approval", "crash-after-completion", ...(engine.startsWith("2.") ? ["models-default", "models-switch", "models-variants", "models-reset"] : [])]) {
+    for (const id of ["exact-prompt-continuation", "crash-after-instruction-registration", "crash-after-admission", "crash-during-approval", "crash-after-completion", ...(mode === "managed" ? ["managed-restart"] : ["socket-fixture-restart"]), ...(engine.startsWith("2.") ? ["models-default", "models-switch", "models-variants", "models-reset"] : [])]) {
       const row = cell.cases.find((row) => row.id === id);
       row.status = status;
       assert.equal(selectGate(report).exitCode, 1, `${engine} ${mode} ${id} ${status}`);
