@@ -1,7 +1,7 @@
 # OpenCode compatibility and operator transition
 
 This guide describes the dual-adapter candidate on `feat/opencode-v1-v2`.
-It is not a release-qualified upgrade recommendation. See the [U7 evidence](research/opencode-u7-verification.md)
+It is not a release-qualified upgrade recommendation. See the [native blocker follow-up](research/opencode-native-blockers-verification.md), [U7 evidence](research/opencode-u7-verification.md)
 and [testing procedure](pipa-testing.md) before choosing a deployment pin.
 
 ## Versions and capabilities
@@ -131,7 +131,17 @@ or establish private operator/plugin compatibility.
   conversion is outside this migration.
 - V1 plugins require an actual compatible v2 implementation. Deterministic local
   definitions/MCP/plugin probes are separate from the operator's inventory.
-  Current native failures/blocked ports remain in the U7 report.
+  The [follow-up evidence](research/opencode-native-blockers-verification.md)
+  corrects the synthetic v2 probes; it does not qualify installed operator plugins.
+  V2 reads `plugins` (compatible package/directory entrypoints) and `mcp.servers`;
+  MCP defaults to Code Mode, with `codemode:false` for direct tool exposure.
+  Renaming keys alone does not convert plugin hooks or qualify credentials.
+- Both v1 pins retain old plugin module bytes after location disposal; a fresh
+  native process loads changed bytes. Their attached `run --command` can return
+  before collecting output (an observed race); isolated standalone invocation returns it, but uses a
+  separate session/process. Both original gates remain failed. V2 file commands
+  work through `opencode api`/`session.command` plus completed-result collection;
+  v2 `run --command` is not available.
 - An attached server must serve the configured workspace and remain independently
   owned through Pipa stop/restart. Loopback attachment is not separate-host proof.
   Remote agent commands need access to the Pipa host for restart/routine CLI work.

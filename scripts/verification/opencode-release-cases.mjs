@@ -290,8 +290,8 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
   }, "profile locks and file staging");
   const config = { botName: "Matrix", workingDirectory: runtime.workspace, slackAppToken: "xapp-synthetic", slackBotToken: "xoxb-synthetic", allowedSlackChannelIds: ["CMATRIX"], allowedSlackUserIds: ["UMATRIX"], allowedSlackBotIds: [] };
   const provider = await createProvider(runtime);
-  const definitions = await writeDefinitions(runtime, `DEFINITION_${randomUUID()}`);
-  const engineConfig = { ...providerConfig(provider.url), mcp: definitions.mcp, plugin: definitions.plugin };
+  const definitions = await writeDefinitions(runtime, `DEFINITION_${randomUUID()}`, pin);
+  const engineConfig = { ...providerConfig(provider.url), ...definitions.config };
   if (pin.startsWith("2.") && (!caseIds || caseIds.some((id) => id.startsWith("models-")))) {
     const modelProvider = (id) => ({ package: "@opencode/ai/providers/openai-compatible", settings: { baseURL: provider.url, apiKey: "synthetic-local-only" }, headers: { "x-matrix-provider": id }, models: {
       matrix: { variants: [{ id: "measured", body: { temperature: 0.37 } }], limit: { context: 64000, output: 8000 } },
@@ -722,9 +722,15 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
     },
     "definitions-mcp-skill": async () => {
       if (requireExecutor()) return requireExecutor();
+      if (pin.startsWith("2.")) await runtime.waitFor(async () => {
+        const response = await fetch(`${baseUrl}/api/mcp?directory=${encodeURIComponent(runtime.workspace)}`, { headers, signal: AbortSignal.timeout(1000) });
+        assert.ok(response.ok, `Native MCP discovery HTTP ${response.status}`);
+        const result = await response.json();
+        return result.data.some((server) => server.name === "matrix" && server.status.status === "connected");
+      }, { timeoutMs: 10000, label: "native fixture MCP connection" });
       for (const [kind, names, args] of [["mcp", ["matrix_nonce", "mcp_matrix_nonce"], {}], ["skill", ["skill"], { name: "matrix-fixture" }]]) {
         const id = `definition-${kind}`;
-        const result = await turn(id, {}, { allowMissingTool: true, tool: { names, arguments: () => args, verify: (results) => assert.ok(JSON.stringify(results).includes(definitions.marker), `Native ${kind} did not return fixture bytes`) } });
+        const result = await turn(id, {}, { allowMissingTool: true, tool: { names, arguments: (_, tool) => kind === "skill" && tool.parameters.properties.id ? { id: "matrix-fixture" } : args, verify: (results) => assert.ok(JSON.stringify(results).includes(definitions.marker), `Native ${kind} did not return fixture bytes: ${JSON.stringify(results).slice(0, 1000)}`) } });
         const missing = provider.receipts.find((receipt) => receipt.prompt === promptFor(id) && receipt.missingTool);
         if (missing) return { status: "BLOCKED", observed: `Real native ${kind} catalog: ${missing.tools.map((tool) => tool.name).join(", ")}; ${names.join("/")} not registered from private file/config` };
         assertTurnOutcome(result, { sessionId: result.sessionId, text: textFor(id) });
@@ -741,14 +747,55 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
       assert.equal((await bounded(inspection.exited, { timeoutMs: 15000 })).code, 0, "Native command capability inspection failed");
       cell.evidence.commandHelp = help.slice(0, 3000);
       const attach = help.includes("--attach") ? "--attach" : help.includes("--server") ? "--server" : null;
-      if (!help.includes("--command") || !attach) return { status: "BLOCKED", observed: `Actual pinned native run --help advertises command=${help.includes("--command")}, attach=${attach ?? "none"}; cannot invoke private file command against the selected server safely` };
+      let invocation;
+      if (pin.startsWith("2.")) {
+        // V2 removed run --command; its supported CLI API invokes session.command.
+        // Admission is not completion: collect only the completed native assistant.
+        const probe = path.join(runtime.workspace, "matrix-command.mjs");
+        await writeFile(probe, `import assert from 'node:assert/strict';
+import {execFileSync} from 'node:child_process';
+import {setTimeout as delay} from 'node:timers/promises';
+const base = ${JSON.stringify(baseUrl)};
+const api = (method, route, data) => execFileSync('opencode', ['api', method, route, '--server', base, ...(data ? ['--data', JSON.stringify(data)] : [])], {encoding:'utf8', timeout:10000});
+const session = JSON.parse(api('POST', '/api/session', {location:{directory:${JSON.stringify(runtime.workspace)}}})).data;
+assert.ok(session.id);
+api('POST', '/api/session/'+session.id+'/command', {name:'matrix-fixture',text:''});
+const deadline = Date.now()+8000;
+while (Date.now()<deadline) {
+  const response = await fetch(base+'/api/session/'+session.id+'/message?limit=100&order=asc', {headers:{authorization:'Basic '+Buffer.from('opencode:'+process.env.OPENCODE_PASSWORD).toString('base64')},signal:AbortSignal.timeout(1000)});
+  assert.ok(response.ok);
+  const messages = (await response.json()).data;
+  const assistant = messages.findLast(message => message.type==='assistant' && typeof message.time?.completed==='number');
+  if (assistant) { assert.ok(!assistant.error); console.log(assistant.content.filter(part=>part.type==='text').map(part=>part.text).join('\\n')); process.exit(0); }
+  await delay(50);
+}
+throw Error('Native file-command completion deadline exceeded');
+`);
+        invocation = `"${process.execPath}" "${probe}"`;
+        cell.evidence.commandInterface = "Pinned opencode api: session.create, session.command, then authoritative completed assistant projection";
+      } else {
+        if (!help.includes("--command") || !attach) return { status: "BLOCKED", observed: `Actual pinned native run --help advertises command=${help.includes("--command")}, attach=${attach ?? "none"}; cannot invoke private file command against the selected server safely` };
+        invocation = `opencode run ${attach} ${baseUrl} --command matrix-fixture${help.includes("--model") ? " --model matrix/matrix" : ""}${help.includes("--format") ? " --format json" : ""}`;
+      }
       provider.register({ prompt: definitions.marker, text: textFor("file-command") });
       const result = await turn("command-via-tool", { onInteraction: async ({ type }) => { assert.equal(type, "permission"); return { type: "reply", reply: "once" }; } }, {
-        tool: { names: ["bash", "shell", "$shell"], arguments: () => ({ command: `opencode run ${attach} ${baseUrl} --command matrix-fixture${help.includes("--model") ? " --model matrix/matrix" : ""}${help.includes("--format") ? " --format json" : ""}`, description: "Invoke the pinned engine's real file-defined command" }) },
+        tool: { names: ["bash", "shell", "$shell"], arguments: () => ({ command: invocation, description: "Invoke the pinned engine's real file-defined command" }) },
       });
       assertTurnOutcome(result, { sessionId: result.sessionId, text: textFor("command-via-tool") });
       assert.ok(provider.receipts.some((receipt) => receipt.prompt === definitions.marker), "Native CLI never expanded the actual command file into a provider request");
       const returned = provider.receipts.find((receipt) => receipt.prompt === promptFor("command-via-tool") && receipt.toolResults.length);
+      if (pin.startsWith("1.") && !JSON.stringify(returned?.toolResults).includes(textFor("file-command"))) {
+        // Characterize the upstream attached-CLI defect without passing its gate.
+        const standalone = await turn("command-standalone", { onInteraction: async ({ type }) => { assert.equal(type, "permission"); return { type: "reply", reply: "once" }; } }, {
+          tool: { names: ["bash"], arguments: () => ({ command: "opencode run --command matrix-fixture --model matrix/matrix --format json", description: "Compare an isolated standalone native file command" }) },
+        });
+        assertTurnOutcome(standalone, { sessionId: standalone.sessionId, text: textFor("command-standalone") });
+        const output = provider.receipts.find((receipt) => receipt.prompt === promptFor("command-standalone") && receipt.toolResults.length);
+        assert.ok(JSON.stringify(output?.toolResults).includes(textFor("file-command")), "Standalone native command also lost output");
+        const loads = (await readFile(definitions.pluginLog, "utf8")).trim().split("\n").map(JSON.parse).filter((entry) => entry.kind === "loaded");
+        assert.ok(loads.some((entry) => entry.version === 2), "Fresh native process did not load modified plugin bytes");
+        cell.evidence.commandStandalone = { completedOutput: true, freshProcessLoadedPluginVersion: 2, attachedOutputMissing: true };
+      }
       assert.ok(JSON.stringify(returned?.toolResults).includes(textFor("file-command")), `Native command result absent from production tool output: ${JSON.stringify(returned?.toolResults).slice(0, 1500)}`);
     },
     "models-switch": async () => {
@@ -941,9 +988,10 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
     "plugin-reload-contract": async () => {
       if (!cell.evidence.reload) return { status: "BLOCKED", observed: "Native location reload case did not reach plugin observation" };
       const before = (await readFile(definitions.pluginLog, "utf8")).trim().split("\n").length;
-      const result = await turn("plugin-version", {}, { tool: { names: ["matrix_nonce", "mcp_matrix_nonce"], arguments: () => ({}), verify: (results) => assert.ok(JSON.stringify(results).includes(definitions.marker)) } });
+      // A built-in tool isolates plugin lifecycle from asynchronous MCP discovery.
+      const result = await turn("plugin-version", {}, { tool: { names: ["read"], arguments: (_, tool) => ({ [tool.parameters.properties.path ? "path" : "filePath"]: path.join(runtime.workspace, ".opencode", "commands", "matrix-fixture.md") }), verify: (results) => assert.ok(JSON.stringify(results).includes(definitions.marker)) } });
       assertTurnOutcome(result, { sessionId: result.sessionId, text: textFor("plugin-version") });
-      const hooks = (await readFile(definitions.pluginLog, "utf8")).trim().split("\n").slice(before).map(JSON.parse).filter((item) => item.kind === "hook" && item.tool.includes("nonce"));
+      const hooks = (await readFile(definitions.pluginLog, "utf8")).trim().split("\n").slice(before).map(JSON.parse).filter((item) => item.kind === "hook" && item.tool === "read");
       cell.evidence.reload.hooks = hooks;
       assert.equal(hooks.length, 1, "Native reload duplicated or lost plugin hook registration");
       assert.equal(hooks[0].version, 2, "Native location dispose/reload retained old plugin module bytes instead of loading modified private file");

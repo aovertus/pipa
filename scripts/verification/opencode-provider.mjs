@@ -106,15 +106,21 @@ export function providerConfig(url) {
   };
 }
 
-export async function writeDefinitions(runtime, marker) {
+export async function writeDefinitions(runtime, marker, pin) {
+  const v2 = pin.startsWith("2.");
   const directory = path.join(runtime.workspace, ".opencode");
   await Promise.all(["skills/matrix-fixture", "agents", "commands", "plugins"].map((name) => mkdir(path.join(directory, name), { recursive: true })));
   await writeFile(path.join(directory, "skills/matrix-fixture/SKILL.md"), `---\nname: matrix-fixture\ndescription: Deterministic matrix skill\n---\nSkill bytes: ${marker}\n`);
   await writeFile(path.join(directory, "agents/matrix-fixture.md"), "---\ndescription: Deterministic matrix child\nmode: subagent\npermission:\n  bash: ask\n  question: allow\n---\nExecute the supplied synthetic child request.\n");
   await writeFile(path.join(directory, "commands/matrix-fixture.md"), `---\ndescription: Deterministic matrix command\n---\n${marker}\n`);
   const pluginLog = path.join(runtime.state, "plugin-loads.txt");
-  const plugin = path.join(runtime.workspace, "matrix-plugin.ts");
-  const rewritePlugin = (version) => writeFile(plugin, `import {appendFileSync} from 'node:fs';\nconst log = item => appendFileSync(${JSON.stringify(pluginLog)}, JSON.stringify({version:${version},...item})+'\\n');\nexport const Matrix = async () => { log({kind:'loaded'}); return {'tool.execute.before': async input => log({kind:'hook',tool:input.tool})}; };\n`);
+  const pluginDirectory = path.join(runtime.workspace, "matrix-plugin");
+  await mkdir(pluginDirectory);
+  const plugin = path.join(pluginDirectory, "index.js");
+  await writeFile(path.join(pluginDirectory, "package.json"), JSON.stringify({ name: "matrix-plugin", type: "module", main: "index.js" }));
+  const rewritePlugin = (version) => writeFile(plugin, `import {appendFileSync} from 'node:fs';\nconst log = item => appendFileSync(${JSON.stringify(pluginLog)}, JSON.stringify({version:${version},...item})+'\\n');\n${v2
+    ? "export default {id:'matrix-fixture', async setup(ctx) { log({kind:'loaded'}); await ctx.tool.hook('execute.before', async input => log({kind:'hook',tool:input.tool})); }};"
+    : "export const Matrix = async () => { log({kind:'loaded'}); return {'tool.execute.before': async input => log({kind:'hook',tool:input.tool})}; };"}\n`);
   await rewritePlugin(1);
   const mcp = path.join(runtime.workspace, "matrix-mcp.cjs");
   await writeFile(mcp, `const readline=require('node:readline');
@@ -128,5 +134,11 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
  else {process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,error:{code:-32601,message:'Unexpected MCP request'}})+'\\n');return;}
  process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result})+'\\n');
 });\n`);
-  return { mcp: { matrix: { type: "local", command: [process.execPath, mcp], enabled: true } }, plugin: [pathToFileURL(plugin).href], pluginLog, rewritePlugin, marker };
+  // V2 defaults MCP tools to Code Mode. This case explicitly qualifies direct
+  // tool execution; Code Mode needs its own execution/catalog evidence.
+  const server = { type: "local", command: [process.execPath, mcp], ...(v2 ? { codemode: false } : { enabled: true }) };
+  const config = v2
+    ? { mcp: { servers: { matrix: server } }, plugins: [pluginDirectory] }
+    : { mcp: { matrix: server }, plugin: [pathToFileURL(plugin).href] };
+  return { config, pluginLog, rewritePlugin, marker };
 }

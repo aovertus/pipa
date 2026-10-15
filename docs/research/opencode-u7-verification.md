@@ -1,5 +1,9 @@
 # U7: compatibility guidance and operator qualification
 
+Follow-up: [native blocker diagnosis and corrected qualification](opencode-native-blockers-verification.md)
+supersedes the v2 synthetic integration failures below and characterizes the
+remaining v1 limitations and installed operator-plugin blockers.
+
 Date: 2026-10-15. Branch: `feat/opencode-v1-v2`. Starting/pushed checkpoint:
 `dc997056766db7541791e4dc17e1142dd413a2a8` (U6). Candidate: Pipa 0.5.4,
 client 2.0.29, Node 22.23.2, macOS ARM64.
