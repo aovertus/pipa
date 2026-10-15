@@ -5,11 +5,14 @@ import { chmod, lstat, mkdir, mkdtemp, open, realpath, rm, writeFile } from "nod
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { createV1Adapter } from "./opencode-v1.mjs";
+import { createV2Adapter } from "./opencode-v2.mjs";
 
 const SLACK_SECRET_ENV_KEY = /(?:^|_)SLACK(?:_[A-Z0-9]+)*_(?:TOKEN|SECRET)$/iu;
 const LISTENING_URL = /https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+/u;
 
-export const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
+export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+export const MAX_ARTIFACT_BYTES = 100 * 1024 * 1024;
 const ARTIFACT_MARKER = "PIPA_ARTIFACTS:";
 const MAX_ARTIFACT_DECLARATION_BYTES = 8 * 1024;
 const MAX_ARTIFACT_PATH_BYTES = 1024;
@@ -95,14 +98,30 @@ export function createOpenCodeExecutor(options = {}) {
   const baseUrl = normalizeBaseUrl(options.baseUrl);
   const fetchImpl = options.fetch ?? fetch;
   const environment = options.environment ?? process.env;
-  const headers = options.connection?.headers ?? authenticationHeaders(environment);
+  let headers = options.connection?.headers ?? authenticationHeaders(environment);
   const pollIntervalMs = options.pollIntervalMs ?? 1_000;
   const useDataUrls = !isLoopbackUrl(baseUrl);
   const remove = options.rm ?? rm;
   const artifactRoot = options.artifactRoot;
   const active = new Set();
   const activeSessions = new Map();
+  let adapter;
+  let readiness;
   let stopReason;
+
+  async function ready(workingDirectory) {
+    readiness ??= (async () => {
+      const connection = options.connection ?? await checkOpenCodeConnection(baseUrl, workingDirectory, { ...options, environment, fetch: fetchImpl });
+      headers = connection.headers ?? headers;
+      adapter = connection.major === 2
+        ? createV2Adapter({ ...options, baseUrl, fetch: fetchImpl, headers, environment, pollIntervalMs })
+        : createV1Adapter({ request, baseUrl, fetchImpl, headers, pollIntervalMs });
+      await adapter.ready?.(workingDirectory);
+    })();
+    await readiness;
+    // Failed turn cleanup blocks subsequent turns even after initial readiness resolved.
+    await adapter.ready?.(workingDirectory);
+  }
 
   async function request(pathname, init, workingDirectory, controller, acceptedStatuses = [200], reportFatal = true) {
     const url = serverUrl(baseUrl, pathname, workingDirectory);
@@ -142,42 +161,29 @@ export function createOpenCodeExecutor(options = {}) {
   async function runTurn({ prompt, sessionId, workingDirectory, contextEnvironment = {}, attachments = [], signal, onSession, onInteraction, onPermissionReplied, onPermissionsReconciled }) {
     if (!prompt?.trim()) throw new Error("A prompt is required.");
     if (stopReason) throw stopReason;
-    const temporaryDirectory = attachments.length ? await mkdtemp(path.join(os.tmpdir(), "pipa-files-")) : null;
+    if (sessionId && activeSessions.has(sessionId)) throw new Error("OpenCode attribution conflict: the session already has an active writer.");
+    let temporaryDirectory;
     const slackTurn = contextEnvironment.PIPA_MESSAGE_CHANNEL === "slack";
     const controller = new AbortController();
     const abort = () => controller.abort(signal.reason);
     if (signal?.aborted) abort();
     else signal?.addEventListener("abort", abort, { once: true });
     active.add(controller);
+    if (sessionId) activeSessions.set(sessionId, { controller, workingDirectory, resolved: false });
     let artifactDirectory;
 
     try {
       try {
+        temporaryDirectory = attachments.length ? await mkdtemp(path.join(os.tmpdir(), "pipa-files-")) : null;
+        controller.signal.throwIfAborted();
         const files = await stageAttachments(attachments, temporaryDirectory, useDataUrls, controller.signal);
         if (stopReason) throw stopReason;
-        let selectedSessionId = sessionId;
-        let messages;
-        if (selectedSessionId) {
-          try {
-            while (true) {
-              const status = (await request("/session/status", { method: "GET" }, workingDirectory, controller))?.[selectedSessionId]?.type;
-              if (status !== "busy" && status !== "retry") break;
-              await delay(pollIntervalMs, controller.signal);
-            }
-            messages = await request(`/session/${encodeURIComponent(selectedSessionId)}/message?limit=1`, { method: "GET" }, workingDirectory, controller);
-          } catch (error) {
-            if (!(error instanceof OpenCodeRequestError) || error.status !== 404) throw error;
-            selectedSessionId = null;
-          }
-        }
-        if (!selectedSessionId) {
-          const session = await request("/session", { method: "POST", body: "{}" }, workingDirectory, controller);
-          if (!session?.id) throw new Error("OpenCode did not create a session.");
-          selectedSessionId = session.id;
-          messages = [];
-        }
+        await ready(workingDirectory);
+        const prepared = await adapter.resolveSession(sessionId, workingDirectory, controller);
+        const selectedSessionId = prepared.sessionId;
 
-        activeSessions.set(selectedSessionId, { controller, workingDirectory });
+        if (activeSessions.has(selectedSessionId) && activeSessions.get(selectedSessionId).controller !== controller) throw new Error("OpenCode attribution conflict: the session already has an active writer.");
+        activeSessions.set(selectedSessionId, { controller, workingDirectory, resolved: true });
         await onSession?.(selectedSessionId);
         if (controller.signal.aborted) throw controller.signal.reason;
 
@@ -191,59 +197,16 @@ export function createOpenCodeExecutor(options = {}) {
           } catch {}
         }
 
-        const baseline = new Set(messages.map((message) => message?.info?.id).filter(Boolean));
-        let dismissed = false;
-        let permissionRejected = false;
-        if (onInteraction) {
-          const watcher = watchInteractions({
-            baseUrl,
-            fetchImpl,
-            headers,
-            sessionId: selectedSessionId,
-            workingDirectory,
-            controller,
-            onInteraction,
-            onPermissionReplied,
-            onPermissionsReconciled,
-            onPermissionRejected: () => { permissionRejected = true; },
-            onDismiss: () => { dismissed = true; },
-            requestTurn: request,
-          });
-          await watcher.ready;
-        }
-        await request(`/session/${encodeURIComponent(selectedSessionId)}/prompt_async`, {
-          method: "POST",
-          body: JSON.stringify(promptBody(prompt, files, contextEnvironment, artifactDirectory)),
-        }, workingDirectory, controller, [204]);
-
-        while (true) {
-          const [currentMessages, statuses] = await Promise.all([
-            request(`/session/${encodeURIComponent(selectedSessionId)}/message?limit=1`, { method: "GET" }, workingDirectory, controller),
-            request("/session/status", { method: "GET" }, workingDirectory, controller),
-          ]);
-          const finalMessage = latestAssistantMessage(currentMessages, baseline);
-          const status = statuses?.[selectedSessionId]?.type;
-          if (dismissed && status !== "busy" && status !== "retry") return { text: "", sessionId: selectedSessionId };
-          if (["error", "failed", "cancelled"].includes(status) || finalMessage?.error) throw new Error("OpenCode failed to complete the turn.");
-          if (finalMessage && ((status !== "retry" && finalMessage.completed && finalMessage.finish === "stop") || status === "idle" || (!status && finalMessage.completed))) {
-            if (!finalMessage.text && permissionRejected) return { text: "Stopped after a permission was rejected.", sessionId: selectedSessionId };
-            if (!finalMessage.text) throw new Error("OpenCode completed without assistant text.");
-            const parsed = slackTurn ? parseArtifactDeclaration(finalMessage.text) : { text: finalMessage.text };
-            const artifacts = artifactDirectory && parsed.paths ? await readArtifacts(artifactDirectory, parsed.paths, options.onArtifactOpened) : [];
-            return {
-              text: parsed.text,
-              sessionId: selectedSessionId,
-              ...(artifacts.length ? { files: artifacts } : {}),
-            };
-          }
-          await delay(pollIntervalMs, controller.signal);
-        }
+        const text = await adapter.execute({ ...prepared, workingDirectory, controller, prompt, files,
+          instructions: turnInstructions(contextEnvironment, artifactDirectory), onInteraction, onPermissionReplied, onPermissionsReconciled });
+        const parsed = slackTurn ? parseArtifactDeclaration(text) : { text };
+        const artifacts = artifactDirectory && parsed.paths ? await readArtifacts(artifactDirectory, parsed.paths, options.onArtifactOpened) : [];
+        return { text: parsed.text, sessionId: selectedSessionId, ...(artifacts.length ? { files: artifacts } : {}) };
+      } catch (error) {
+        if (controller.signal.aborted) throw controller.signal.reason;
+        throw error;
       } finally {
         controller.abort(new Error("OpenCode turn completed."));
-        active.delete(controller);
-        for (const [sessionId, turn] of activeSessions) {
-          if (turn.controller === controller) activeSessions.delete(sessionId);
-        }
       }
     } catch (error) {
       if (stopReason) throw stopReason;
@@ -264,21 +227,24 @@ export function createOpenCodeExecutor(options = {}) {
         }
       }
       signal?.removeEventListener("abort", abort);
+      active.delete(controller);
+      for (const [sessionId, turn] of activeSessions) {
+        if (turn.controller === controller) activeSessions.delete(sessionId);
+      }
     }
   }
 
   return {
+    ready,
     runTurn,
     async abortTurn(sessionId, reason = new Error("OpenCode turn aborted.")) {
       const turn = activeSessions.get(sessionId);
       if (!turn) return;
-      const abortController = new AbortController();
       try {
-        await request(`/session/${encodeURIComponent(sessionId)}/abort`, { method: "POST" }, turn.workingDirectory, abortController, [200, 204, 404], false);
+        if (turn.resolved) await adapter.abortTurn(sessionId, turn.workingDirectory);
       } catch {
         // Local cancellation still supersedes the turn if OpenCode's abort request fails.
       } finally {
-        abortController.abort(reason);
         turn.controller.abort(reason);
       }
     },
@@ -385,13 +351,14 @@ export async function runOpenCodeVersion(options = {}) {
 async function stageAttachments(attachments, temporaryDirectory, useDataUrls, signal) {
   const files = [];
   for (const [index, attachment] of attachments.entries()) {
+    if (attachment.size !== undefined && (!Number.isSafeInteger(attachment.size) || attachment.size < 0 || attachment.size > MAX_ATTACHMENT_BYTES)) throw new Error("Attached files must be 10 MiB or smaller.");
     let data;
     try {
       data = await abortable(attachment.fetchData(), signal);
     } catch {
       throw new Error("Could not read one of the attached files. Please try uploading it again.");
     }
-    if (data.byteLength > MAX_ATTACHMENT_BYTES) throw new Error("Attached files must be 100 MB or smaller.");
+    if (data.byteLength > MAX_ATTACHMENT_BYTES) throw new Error("Attached files must be 10 MiB or smaller.");
     try {
       const filename = sanitizeFilename(path.basename(attachment.name || "attachment"), "attachment");
       const file = path.join(temporaryDirectory, `${index + 1}-${filename}`);
@@ -409,8 +376,7 @@ async function stageAttachments(attachments, temporaryDirectory, useDataUrls, si
   return files;
 }
 
-function promptBody(prompt, files, contextEnvironment, artifactDirectory) {
-  const parts = [{ type: "text", text: prompt }, ...files.map((file) => ({ type: "file", ...file }))];
+function turnInstructions(contextEnvironment, artifactDirectory) {
   const context = Object.entries(contextEnvironment).filter(([, value]) => value !== undefined && value !== null && String(value));
   const instructions = ["For scheduling requests, consult `pipa routine --help`, convert timezone wording to an IANA timezone, preview first, show the normalized details, and create only after user confirmation."];
   const restartCommand = contextEnvironment.PIPA_MESSAGE_CHANNEL === "slack" && contextEnvironment.PIPA_CURRENT_SLACK_CHANNEL_ID
@@ -422,10 +388,7 @@ function promptBody(prompt, files, contextEnvironment, artifactDirectory) {
     instructions.push("Keep naturally short answers inline. For deeper work or larger deliverables, keep the Slack response concise and use the most suitable artifact format.");
     if (artifactDirectory) instructions.push(`To attach files, copy up to 10 top-level files (100 MB total) to this private artifact directory: ${artifactDirectory}\nOnly if you created files, end your response with exactly one final line in this format: ${ARTIFACT_MARKER} [\"report.csv\",\"brief.pdf\"]\nDo not emit ${ARTIFACT_MARKER} otherwise.`);
   }
-  return {
-    parts,
-    ...(instructions.length ? { system: instructions.join("\n\n") } : {}),
-  };
+  return instructions.join("\n\n");
 }
 
 function parseArtifactDeclaration(text) {
@@ -477,7 +440,7 @@ async function readArtifacts(directory, paths, onOpened) {
         const before = await handle.stat({ bigint: true });
         await onOpened?.(filename);
         const size = Number(before.size);
-        if (!before.isFile() || size > MAX_ATTACHMENT_BYTES || total + size > MAX_ATTACHMENT_BYTES) throw new Error("Artifact exceeds delivery limits.");
+        if (!before.isFile() || size > MAX_ARTIFACT_BYTES || total + size > MAX_ARTIFACT_BYTES) throw new Error("Artifact exceeds delivery limits.");
         const data = Buffer.alloc(size + 1);
         let bytesRead = 0;
         while (bytesRead < data.length) {
@@ -507,24 +470,6 @@ function changedFile(before, after) {
 function sanitizeFilename(value, fallback = "artifact") {
   const sanitized = value.replace(/[<>:"/\\|?*\u0000-\u001f]/gu, "_").replace(/[. ]+$/u, "");
   return Array.from(sanitized).reduce((result, character) => Buffer.byteLength(result + character) <= 200 ? result + character : result, "") || fallback;
-}
-
-function latestAssistantMessage(messages, baseline) {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (!message?.info?.id || baseline.has(message.info.id) || message.info.role !== "assistant") continue;
-    return {
-      completed: typeof message.info.time?.completed === "number",
-      error: message.info.error,
-      finish: message.info.finish,
-      text: message.parts
-        .filter((part) => part.type === "text" && typeof part.text === "string" && part.text)
-        .map((part) => part.text)
-        .join("\n")
-        .trim(),
-    };
-  }
-  return null;
 }
 
 function ownedServer(baseUrl, child, exit, platform) {
@@ -704,6 +649,9 @@ function ownedEnvironment(environment, major) {
   if (major === 2) {
     clean.OPENCODE_PASSWORD = password;
     clean.OPENCODE_SERVER_USERNAME = "opencode";
+    // 2.0.29's grouped Base64 regex exhausts Bun's default regexp stack on
+    // valid 10 MiB files. This VM ceiling fixes it without changing file bytes.
+    clean.BUN_JSC_maxRegExpStackSize ??= String(512 * 1024 * 1024);
   }
   return clean;
 }
@@ -740,187 +688,6 @@ function delay(delayMs, signal) {
     const timer = setTimeout(() => settle(resolve), delayMs);
     signal?.addEventListener("abort", abort, { once: true });
   });
-}
-
-function watchInteractions({ baseUrl, fetchImpl, headers, sessionId, workingDirectory, controller, onInteraction, onPermissionReplied, onPermissionsReconciled, onPermissionRejected, onDismiss, requestTurn }) {
-  const seenIds = new Set();
-  const messages = new Map();
-  const parents = new Map();
-  const interactionSessionIds = new Set([sessionId]);
-  let resolveReady;
-  let rejectReady;
-  let subscribed = false;
-  const ready = new Promise((resolve, reject) => {
-    resolveReady = resolve;
-    rejectReady = reject;
-  });
-  const dispatch = async (event) => {
-    const type = event.type === "question.asked" ? "question" : event.type === "permission.asked" ? "permission" : null;
-    const properties = event.properties && typeof event.properties === "object" ? event.properties : event.data && typeof event.data === "object" ? event.data : event;
-    const interactionSessionId = properties?.sessionID ?? properties?.sessionId;
-    const requestId = properties?.requestID ?? properties?.requestId ?? properties?.id;
-    if (!type || (interactionSessionId !== sessionId && !await belongsToSession(interactionSessionId)) || !requestId || seenIds.has(`${type}:${requestId}`)) return;
-    seenIds.add(`${type}:${requestId}`);
-    const request = type === "permission" ? await hydratePermission(properties, interactionSessionId) : properties;
-    void settleInteraction({ type, requestId, sessionId: interactionSessionId, request, onInteraction, onPermissionRejected, onDismiss, controller, workingDirectory, requestTurn });
-  };
-
-  const belongsToSession = async (candidate) => {
-    const original = candidate;
-    const visited = new Set();
-    while (candidate && !visited.has(candidate)) {
-      if (candidate === sessionId) {
-        interactionSessionIds.add(original);
-        return true;
-      }
-      visited.add(candidate);
-      if (!parents.has(candidate)) parents.set(candidate, requestTurn(`/session/${encodeURIComponent(candidate)}`, { method: "GET" }, workingDirectory, controller)
-        .then((session) => session?.parentID));
-      candidate = await parents.get(candidate);
-    }
-    return false;
-  };
-
-  const hydratePermission = async (permission, interactionSessionId) => {
-    const tool = permission.tool;
-    if (!tool?.messageID || !tool.callID) return permission;
-    if (!messages.has(tool.messageID)) {
-      messages.set(tool.messageID, requestTurn(`/session/${encodeURIComponent(interactionSessionId)}/message?limit=100`, { method: "GET" }, workingDirectory, controller)
-        .then((items) => items.flatMap((message) => message.info?.id === tool.messageID ? message.parts ?? [] : [])));
-    }
-    const part = (await messages.get(tool.messageID)).find((item) => item.callID === tool.callID);
-    return part ? { ...permission, tool: { ...tool, name: part.tool, input: part.state?.input } } : permission;
-  };
-
-  const reconcile = async () => {
-    const permissions = await requestTurn("/permission", { method: "GET" }, workingDirectory, controller);
-    const pending = (await Promise.all((permissions ?? []).map(async (permission) => {
-      return await belongsToSession(permission?.sessionID) ? permission : null;
-    }))).filter(Boolean);
-    await Promise.all(pending.map((permission) => dispatch({ type: "permission.asked", properties: permission })));
-    for (const interactionSessionId of interactionSessionIds) {
-      const requests = pending.filter((permission) => permission.sessionID === interactionSessionId);
-      onPermissionsReconciled?.({ sessionId: interactionSessionId, requestIds: new Set(requests.map((permission) => permission.id)) });
-    }
-  };
-
-  const watching = (async () => {
-    while (!controller.signal.aborted) {
-      try {
-        const url = serverUrl(baseUrl, "/event", workingDirectory);
-        const response = await fetchImpl(url, {
-          headers: { ...headers, accept: "text/event-stream" },
-          signal: controller.signal,
-        });
-        if (!response.ok) throw new OpenCodeRequestError(response.status);
-        await reconcile();
-        if (!subscribed) {
-          subscribed = true;
-          resolveReady();
-        }
-        for await (const event of readServerSentEvents(response, controller.signal)) {
-          if (controller.signal.aborted) return;
-          const properties = event.properties && typeof event.properties === "object" ? event.properties : event.data && typeof event.data === "object" ? event.data : event;
-          const interactionSessionId = properties?.sessionID ?? properties?.sessionId;
-          if (event.type === "permission.replied" && (interactionSessionId === sessionId || await belongsToSession(interactionSessionId))) {
-            onPermissionReplied?.({ sessionId: interactionSessionId, requestId: properties?.requestID ?? properties?.requestId, reply: properties?.reply });
-            await reconcile();
-            continue;
-          }
-          await dispatch(event);
-        }
-        await reconcile();
-        await delay(250, controller.signal).catch(() => undefined);
-      } catch (error) {
-        if (controller.signal.aborted) {
-          if (!subscribed) rejectReady(controller.signal.reason);
-          return;
-        }
-        if (!subscribed) {
-          rejectReady(error);
-          return;
-        }
-        await delay(250, controller.signal).catch(() => undefined);
-      }
-    }
-  })();
-  void watching.catch((error) => {
-    if (!subscribed) rejectReady(error);
-    else if (!controller.signal.aborted) process.stderr.write("OpenCode interaction watcher failed.\n");
-  });
-  return { ready };
-}
-
-async function settleInteraction({ type, requestId, sessionId, request: interactionRequest, onInteraction, onPermissionRejected, onDismiss, controller, workingDirectory, requestTurn }) {
-  try {
-    const decision = await abortable(Promise.resolve().then(() => onInteraction({
-      type,
-      sessionId,
-      request: interactionRequest,
-      signal: controller.signal,
-    })), controller.signal);
-    if (decision?.type === "cancelled" || decision?.type === "stopped") return;
-    if (decision?.type === "stop") {
-      onDismiss?.();
-      if (type === "question") await requestTurn(`/question/${encodeURIComponent(requestId)}/reject`, { method: "POST" }, workingDirectory, controller, [200, 204, 404], false);
-      else await requestTurn(`/permission/${encodeURIComponent(requestId)}/reply`, { method: "POST", body: JSON.stringify({ reply: "reject" }) }, workingDirectory, controller, [200, 204, 404], false);
-      await requestTurn(`/session/${encodeURIComponent(sessionId)}/abort`, { method: "POST" }, workingDirectory, controller, [200, 204], false);
-      return;
-    }
-    if (type === "question" && decision?.type === "answer") {
-      await requestTurn(`/question/${encodeURIComponent(requestId)}/reply`, { method: "POST", body: JSON.stringify({ answers: decision.answers }) }, workingDirectory, controller, [200, 204, 404], false);
-    } else if (type === "question" && decision?.type === "reject") {
-      await requestTurn(`/question/${encodeURIComponent(requestId)}/reject`, { method: "POST" }, workingDirectory, controller, [200, 204, 404], false);
-    } else if (type === "permission" && (decision?.type === "reply" || decision?.type === "reject")) {
-      const reply = decision.type === "reject" ? "reject" : decision.reply;
-      if (!["once", "always", "reject"].includes(reply)) throw new Error("Invalid OpenCode permission decision.");
-      try {
-        await requestTurn(`/permission/${encodeURIComponent(requestId)}/reply`, { method: "POST", body: JSON.stringify({ reply }) }, workingDirectory, controller, [200, 204], false);
-      } catch (error) {
-        if (error instanceof OpenCodeRequestError && error.status === 404) return;
-        throw error;
-      }
-      if (reply === "reject") onPermissionRejected?.();
-    } else {
-      throw new Error(`Invalid OpenCode ${type} decision.`);
-    }
-  } catch (error) {
-    if (!controller.signal.aborted) process.stderr.write(`OpenCode interaction handler error: ${error.message}\n`);
-  }
-}
-
-async function* readServerSentEvents(response, signal) {
-  const reader = response.body?.getReader();
-  if (!reader) return;
-  const abort = () => reader.cancel().catch(() => undefined);
-  signal?.addEventListener("abort", abort, { once: true });
-  const decoder = new TextDecoder();
-  let buffer = "";
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      let boundary = buffer.indexOf("\n\n");
-      while (boundary >= 0) {
-        const chunk = buffer.slice(0, boundary);
-        buffer = buffer.slice(boundary + 2);
-        const lines = chunk.split("\n");
-        const data = lines.filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
-        const id = lines.find((line) => line.startsWith("id:"))?.slice(3).trim();
-        const type = lines.find((line) => line.startsWith("event:"))?.slice(6).trim();
-        if (data) {
-          try {
-            const event = JSON.parse(data);
-            yield type ? { id, type, data: event } : event;
-          } catch { /* ponytail: skip non-JSON SSE frames */ }
-        }
-        boundary = buffer.indexOf("\n\n");
-      }
-    }
-  } finally {
-    signal?.removeEventListener("abort", abort);
-  }
 }
 
 function abortable(operation, signal) {

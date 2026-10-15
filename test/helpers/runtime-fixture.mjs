@@ -76,7 +76,7 @@ export async function createRuntimeFixture({ environment = process.env, allowEnv
   function spawn(command, args = [], options = {}) {
     controller.signal.throwIfAborted();
     const child = launchOwned(crossSpawn, command, args, {
-      ...options, cwd: options.cwd ?? directories.workspace, env,
+      ...options, cwd: options.cwd ?? directories.workspace, env: options.env ?? env,
       detached: process.platform !== "win32", shell: false,
       stdio: options.stdio ?? ["ignore", "pipe", "pipe"],
     }, ownership);

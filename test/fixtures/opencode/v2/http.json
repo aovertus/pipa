@@ -40,6 +40,18 @@
       "responses": [{ "json": { "data": { "id": "ses_contract", "projectID": "prj_contract", "cost": 0, "tokens": { "input": 0, "output": 0, "reasoning": 0, "cache": { "read": 0, "write": 0 } }, "time": { "created": 1, "updated": 1 }, "location": { "directory": "$WORKSPACE" } } } }]
     },
     {
+      "method": "GET", "path": "/api/session/ses_contract", "repeatLast": true,
+      "responses": [{ "json": { "data": { "id": "ses_contract", "projectID": "prj_contract", "time": { "created": 1, "updated": 1 }, "location": { "directory": "$WORKSPACE" } } } }]
+    },
+    {
+      "method": "GET", "path": "/api/session/active", "repeatLast": true,
+      "responses": [{ "json": { "data": {} } }]
+    },
+    {
+      "method": "GET", "path": "/api/session/ses_contract/inbox", "repeatLast": true,
+      "responses": [{ "json": { "data": [] } }]
+    },
+    {
       "method": "POST", "path": "/api/session/ses_contract/prompt",
       "body": { "id": "msg_input", "text": "  contract `prompt` $(untouched) café  \n" },
       "responses": [{ "json": { "data": { "id": "msg_input", "sessionID": "ses_contract", "time": { "created": 2 }, "type": "user", "payload": { "text": "  contract `prompt` $(untouched) café  \n" }, "delivery": "steer" } } }]

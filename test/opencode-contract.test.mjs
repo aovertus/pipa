@@ -4,7 +4,7 @@ import { access, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { createConversationRunner } from "../src/app.mjs";
+import { createConversationRunner, startPipa } from "../src/app.mjs";
 import { cleanChildEnvironment, createOpenCodeExecutor, startSocketOpenCodeServer } from "../src/opencode.mjs";
 import { acquireInstanceLock, createSessionStore, pipaPaths } from "../src/state.mjs";
 import { bounded, createRuntimeFixture, waitFor } from "./helpers/runtime-fixture.mjs";
@@ -84,11 +84,31 @@ async function fixture(t, generation = "v1", options = {}) {
   const runtime = await createRuntimeFixture({ timeoutMs: 10_000 });
   t.after(() => runtime.teardown());
   const document = await loadWireFixture(generation, runtime);
+  if (generation === "v2") {
+    const projected = document.routes.find((route) => route.path.endsWith("/message"));
+    projected.responses.unshift(...[0, 1].map(() => ({ json: { data: [], cursor: { previous: null, next: null } } })));
+    projected.repeatLast = true;
+  }
   const wire = createWireFixture(document, options);
-  const executor = createOpenCodeExecutor({ baseUrl: "http://127.0.0.1:4096", fetch: wire.fetch, environment: runtime.env, artifactRoot: runtime.artifactRoot, pollIntervalMs: 1 });
+  const nativeFetch = async (url, init) => {
+    const parsed = new URL(url);
+    if (generation === "v2" && parsed.pathname.includes("/instructions/entries/")) {
+      const saved = JSON.parse(await readFile(pipaPaths(runtime.home).openCodeRecovery, "utf8"));
+      assert.equal(saved.records.length, 1, "ownership must be durable before instruction writes");
+      const key = parsed.pathname.split("/").at(-1);
+      assert.equal(key, saved.records[0].key);
+      assert.match(key, /^pipa-[a-f0-9]{16}-[a-f0-9-]{36}$/u);
+      if (!document.routes.some((route) => route.path === parsed.pathname)) {
+        for (const method of ["PUT", "DELETE"]) document.routes.push({ method, path: parsed.pathname, responses: [{ status: 204 }], required: method === init.method });
+      }
+    }
+    return wire.fetch(url, init);
+  };
+  const selectedFetch = options.transport ? (url, init) => options.transport(url, init, nativeFetch) : nativeFetch;
+  const executor = createOpenCodeExecutor({ baseUrl: "http://127.0.0.1:4096", connection: { major: generation === "v1" ? 1 : 2, headers: {} }, fetch: selectedFetch, environment: runtime.env, artifactRoot: runtime.artifactRoot, pollIntervalMs: 1, inputId: () => "msg_input", ...options.executorOptions });
   runtime.defer(() => executor.stopAll(), "executor");
   const input = { prompt: document.prompt, sessionId: document.expected.sessionId, workingDirectory: runtime.workspace, signal: runtime.signal };
-  return { runtime, document, wire, executor, input };
+  return { runtime, document, wire, executor, input, fetch: selectedFetch };
 }
 
 test("v1 baseline: exact prompt, trusted context and persisted-session continuation", async (t) => {
@@ -219,12 +239,11 @@ for (const failure of ["malformed response", "malformed envelope", "provider fai
   else wire.assertComplete();
 });
 
-test("v1 baseline FAIL observation: production ignores a malformed projected envelope before a valid later poll", async (t) => {
+test("v1 U2: production rejects a malformed projected envelope before a valid later poll", async (t) => {
   const { executor, input, document, wire } = await fixture(t);
   document.routes.find((route) => route.path.endsWith("/message")).responses[1] = { raw: '{"data":[]}' };
-  await runTurnContract({ executor, input, expected: document.expected, caseName: "v1 malformed envelope recovery observation" });
+  await assert.rejects(runTurnContract({ executor, input, expected: document.expected, caseName: "v1 malformed envelope" }), /invalid message projection/u);
   wire.assertComplete();
-  t.diagnostic("Malformed-envelope rejection FAIL in current production: non-array message envelope was silently ignored. Structured fixture JSON rejects this; raw wire injection records the existing behavior without changing src.");
 });
 
 test("v2 native wire integrity: data envelopes, stable-ID admission, projected idle and keyed replies (not adapter proof)", async (t) => {
@@ -256,13 +275,12 @@ test("v2 native wire integrity: data envelopes, stable-ID admission, projected i
   validateEventStream(windows.routes.find((route) => route.path === "/api/event").responses[0].sse, "v2");
 });
 
-for (const sessionId of [null, "ses_contract"]) test(`v2 baseline FAIL observation: ${sessionId ? "R2 continuation rejects legacy HTML" : "R1/R14 new turn uses unsupported v1 admission"}`, async (t) => {
+for (const sessionId of [null, "ses_contract"]) test(`v2 U2: ${sessionId ? "R2 retains mapped session" : "R1 new prepared turn"}`, async (t) => {
   const { executor, input, document, wire } = await fixture(t, "v2");
   const caseName = sessionId ? "v2 session continuation" : "v2 prompt completion";
-  await assert.rejects(runTurnContract({ executor, input: { ...input, sessionId }, expected: document.expected, caseName }), sessionId ? /v2 session continuation: OpenCode returned an invalid response/u : /v2 prompt completion: OpenCode request failed with status 405/u);
-  assert.equal(wire.calls.some((call) => call.path.startsWith("/api/")), false);
+  await runTurnContract({ executor, input: { ...input, sessionId }, expected: document.expected, caseName });
+  assert.equal(wire.calls.some((call) => call.path.startsWith("/session")), false);
   wire.assertComplete();
-  t.diagnostic(`Compatibility FAIL (expected pre-port observation): ${caseName}; no v2 adapter selected. This passing characterization is not a compatibility pass.`);
 });
 
 test("R1 U1: attached identity and workspace readiness select both generations", async (t) => {
@@ -278,6 +296,866 @@ test("R1 U1: attached identity and workspace readiness select both generations",
     assert.equal(wire.calls.some((call) => call.path === "/api/info"), generation === "v2");
     wire.assertComplete();
   }
+});
+
+test("U2 standalone facade negotiates authenticated identity before selecting either adapter", async (t) => {
+  for (const generation of ["v1", "v2"]) {
+    const { runtime, wire, document, input, fetch: fixtureFetch } = await fixture(t, generation);
+    const executor = createOpenCodeExecutor({ baseUrl: "http://127.0.0.1:4096", environment: runtime.env, fetch: fixtureFetch, pollIntervalMs: 1, inputId: () => "msg_input" });
+    await runTurnContract({ executor, input, expected: document.expected });
+    await executor.ready(runtime.workspace);
+    assert.equal(wire.calls.filter((call) => call.path === "/global/health").length, 1);
+    assert.equal(wire.calls.some((call) => call.path === "/api/info"), generation === "v2");
+    executor.stopAll();
+    wire.assertComplete();
+  }
+});
+
+test("U2 recovery failure gates subscriptions, Slack connection and routine construction", async () => {
+  const seen = [];
+  await assert.rejects(startPipa({ config: { botName: "Pipa", workingDirectory: "/work" },
+    checkSlackToken: async () => ({}), sessionStore: { keys: () => { seen.push("subscriptions"); return []; } },
+    chat: { initialize: () => seen.push("Slack") }, state: { connect: () => seen.push("state") },
+    server: { baseUrl: "http://127.0.0.1:4096", stop: () => seen.push("stop"), wait: async () => undefined },
+    createExecutor: () => ({ ready: async () => { throw new Error("abandoned cleanup failed"); } }),
+    createRoutineScheduler: () => seen.push("routines"),
+  }), /abandoned cleanup failed/u);
+  assert.deepEqual(seen, ["stop"]);
+});
+
+test("v2 U2: loss before admission retries the exact same ID; loss after admission reconciles without resubmission", async (t) => {
+  for (const accepted of [false, true]) {
+    let attempts = 0;
+    const current = await fixture(t, "v2", { transport: async (url, init, next) => {
+      if (!new URL(url).pathname.endsWith("/prompt")) return next(url, init);
+      attempts += 1;
+      if (attempts === 1) {
+        assert.equal(JSON.parse(init.body).id, "msg_input");
+        if (accepted) await next(url, init);
+        throw new TypeError("lost response");
+      }
+      return next(url, init);
+    } });
+    const { executor, input, document, wire, runtime } = current;
+    if (!accepted) document.routes.find((route) => route.path.endsWith("/message")).responses.splice(2, 0, { json: { data: [], cursor: { previous: null, next: null } } });
+    await runTurnContract({ executor, input, expected: document.expected });
+    assert.equal(attempts, accepted ? 1 : 2);
+    assert.equal(wire.calls.filter((call) => call.path.endsWith("/prompt")).length, 1);
+    assert.deepEqual(JSON.parse(await readFile(pipaPaths(runtime.home).openCodeRecovery, "utf8")).records, []);
+    wire.assertComplete();
+  }
+});
+
+test("v2 U2: permanent admission rejection cleans context and permits a later turn", async (t) => {
+  let rejected = false;
+  let admitted = false;
+  const { executor, input, document, wire, runtime } = await fixture(t, "v2", { transport: async (url, init, next) => {
+    if (!rejected && new URL(url).pathname.endsWith("/prompt")) {
+      rejected = true;
+      return new Response(JSON.stringify({ _tag: "AttachmentError", message: "attachment unavailable" }), { status: 400, headers: { "content-type": "application/json" } });
+    }
+    if (new URL(url).pathname.endsWith("/prompt")) admitted = true;
+    if (new URL(url).pathname.endsWith("/message") && rejected && !admitted) return new Response(JSON.stringify({ data: [], cursor: { previous: null, next: null } }), { headers: { "content-type": "application/json" } });
+    return next(url, init);
+  } });
+  await assert.rejects(executor.runTurn(input), /attachment unavailable/u);
+  assert.deepEqual(JSON.parse(await readFile(pipaPaths(runtime.home).openCodeRecovery, "utf8")).records, []);
+  const event = document.routes.find((route) => route.path === "/api/event");
+  event.responses.push(structuredClone(event.responses[0]));
+  await runTurnContract({ executor, input, expected: document.expected });
+  wire.assertComplete();
+});
+
+test("v2 U2: single-writer active cancellation interrupts and settles before cleanup", async (t) => {
+  let admitted = false;
+  let interrupted = false;
+  let polls = 0;
+  const { executor, input, document, wire, runtime } = await fixture(t, "v2", { transport: async (url, init, next) => {
+    const pathname = new URL(url).pathname;
+    if (pathname.endsWith("/prompt")) { admitted = true; return next(url, init); }
+    if (pathname.endsWith("/interrupt")) {
+      assert.equal(init.signal.aborted, false);
+      interrupted = true;
+      return new Response(JSON.stringify({ interrupted: true }), { headers: { "content-type": "application/json" } });
+    }
+    if (pathname.endsWith("/message") && admitted) {
+      polls += 1;
+      const result = structuredClone(document.routes.find((route) => route.path.endsWith("/message")).responses[2].json);
+      if (!interrupted) result.data.pop();
+      else result.data.at(-1).outcome = "interrupted";
+      return new Response(JSON.stringify(result), { headers: { "content-type": "application/json" } });
+    }
+    return next(url, init);
+  } });
+  let delivered = false;
+  const turn = executor.runTurn(input).then(() => { delivered = true; });
+  const rejection = assert.rejects(turn, /cancelled|cleanup failed/u);
+  await waitFor(() => polls >= 2);
+  assert.equal(delivered, false);
+  await executor.abortTurn("ses_contract", new Error("cancelled"));
+  await rejection;
+  assert.equal(interrupted, true);
+  assert.deepEqual(JSON.parse(await readFile(pipaPaths(runtime.home).openCodeRecovery, "utf8")).records, []);
+  await executor.ready(input.workingDirectory);
+  wire.assertComplete();
+});
+
+for (const lostReply of [false, true]) test(`v2 U2: interrupt acceptance without terminal settlement retains recovery (lost reply: ${lostReply})`, async (t) => {
+  let admitted = false;
+  let interrupted = false;
+  let polls = 0;
+  const { executor, input, document, runtime, wire } = await fixture(t, "v2", { executorOptions: { cleanupTimeoutMs: 30 }, transport: async (url, init, next) => {
+    const pathname = new URL(url).pathname;
+    if (pathname.endsWith("/prompt")) { admitted = true; return next(url, init); }
+    if (pathname.endsWith("/interrupt")) {
+      assert.equal(pathname, "/api/session/ses_contract/interrupt");
+      interrupted = true;
+      if (lostReply) throw new TypeError("lost interrupt acknowledgement");
+      return new Response(JSON.stringify({ interrupted: true }), { headers: { "content-type": "application/json" } });
+    }
+    if (pathname.endsWith("/message") && admitted) {
+      polls += 1;
+      const page = structuredClone(document.routes.find((route) => route.path.endsWith("/message")).responses[2].json);
+      page.data.pop();
+      return new Response(JSON.stringify(page), { headers: { "content-type": "application/json" } });
+    }
+    return next(url, init);
+  } });
+  const turn = executor.runTurn(input).catch((error) => error);
+  await waitFor(() => polls >= 2);
+  await executor.abortTurn("ses_contract");
+  assert.ok(await turn instanceof Error);
+  assert.equal(interrupted, true);
+  assert.equal(JSON.parse(await readFile(pipaPaths(runtime.home).openCodeRecovery, "utf8")).records.length, 1);
+  await assert.rejects(executor.ready(runtime.workspace), /blocked/u);
+  wire.assertComplete();
+});
+
+test("v2 review: cancelled instruction PUT is awaited independently before any DELETE", async (t) => {
+  const entered = Promise.withResolvers();
+  const commit = Promise.withResolvers();
+  const controller = new AbortController();
+  let instructionPresent = false;
+  let deletes = 0;
+  let registered;
+  const { executor, input, runtime, wire } = await fixture(t, "v2", { transport: async (url, init, next) => {
+    if (new URL(url).pathname.includes("/instructions/entries/")) {
+      if (init.method === "PUT") {
+        registered = JSON.parse(await readFile(pipaPaths(runtime.home).openCodeRecovery, "utf8")).records[0];
+        entered.resolve();
+        const committed = commit.promise.then(() => { instructionPresent = true; return new Response(null, { status: 204 }); });
+        return Promise.race([committed, new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }))]);
+      }
+      deletes += 1;
+      instructionPresent = false;
+    }
+    return next(url, init);
+  } });
+  const turn = executor.runTurn({ ...input, signal: controller.signal });
+  const rejected = assert.rejects(turn, /cancel PUT/u);
+  await entered.promise;
+  controller.abort(new Error("cancel PUT"));
+  await new Promise((resolve) => setImmediate(resolve));
+  const earlyDeletes = deletes;
+  commit.resolve();
+  await rejected;
+  assert.equal(earlyDeletes, 0);
+  assert.equal(instructionPresent, false, "a late PUT must not recreate context after DELETE");
+  assert.equal(registered.instruction, "putting", "uncertainty must be journaled before PUT");
+  assert.deepEqual(JSON.parse(await readFile(pipaPaths(runtime.home).openCodeRecovery, "utf8")).records, []);
+  wire.assertComplete();
+});
+
+for (const fault of ["lost reply", "mutation timeout"]) test(`v2 U2: native synchronous instruction commit with ${fault} is removed and readiness recovers`, async (t) => {
+  const entered = Promise.withResolvers();
+  const controller = new AbortController();
+  let present = false;
+  let deletes = 0;
+  const { executor, input, runtime, wire, fetch: nativeFetch } = await fixture(t, "v2", { executorOptions: { instructionMutationTimeoutMs: 15 }, transport: async (url, init, next) => {
+    if (new URL(url).pathname.includes("/instructions/entries/")) {
+      if (init.method === "PUT") {
+        present = true; // Native received-body handler performs its SQL mutation before replying.
+        entered.resolve();
+        if (fault === "lost reply") throw new TypeError("lost instruction reply");
+        return new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }));
+      }
+      deletes += 1;
+      present = false;
+    }
+    return next(url, init);
+  } });
+  const turn = executor.runTurn({ ...input, signal: controller.signal });
+  const failure = turn.catch((error) => error);
+  await entered.promise;
+  if (fault === "mutation timeout") controller.abort(new Error("cancel while PUT pending"));
+  await failure;
+  assert.equal(present, false);
+  const saved = JSON.parse(await readFile(pipaPaths(runtime.home).openCodeRecovery, "utf8"));
+  assert.deepEqual(saved.records, []);
+  assert.equal(deletes, 1);
+  await executor.ready(input.workingDirectory);
+  const restarted = createOpenCodeExecutor({ baseUrl: "http://127.0.0.1:4096", connection: { major: 2, headers: {} }, environment: runtime.env, fetch: nativeFetch });
+  await restarted.ready(runtime.workspace);
+  assert.equal(deletes, 1);
+  restarted.stopAll();
+  wire.assertComplete();
+});
+
+test("v2 U2: real HTTP synchronous PUT with a lost acknowledgement is cleaned before reuse", async (t) => {
+  const current = await fixture(t, "v2");
+  const { runtime, input, wire } = current;
+  const entered = Promise.withResolvers();
+  let present = false;
+  let deletes = 0;
+  const errors = [];
+  const server = createServer(async (request, response) => {
+    try {
+      assert.equal(request.headers.authorization, "Basic synthetic-http");
+      let body = "";
+      for await (const chunk of request) body += chunk;
+      const pathname = new URL(request.url, "http://127.0.0.1").pathname;
+      if (pathname === "/api/event") {
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.write('data: {"id":"evt_http_connected","type":"server.connected","data":{}}\n\n');
+        return;
+      }
+      if (pathname.includes("/instructions/entries/") && request.method === "PUT") {
+        present = true;
+        entered.resolve(); // Lose only the reply, not the server's already completed SQL mutation.
+        return;
+      }
+      if (pathname.includes("/instructions/entries/") && request.method === "DELETE") { deletes += 1; present = false; }
+      const result = await current.fetch(`http://127.0.0.1${request.url}`, { method: request.method, ...(body ? { body } : {}) });
+      response.writeHead(result.status, Object.fromEntries(result.headers));
+      response.end(result.status === 204 ? undefined : await result.text());
+    } catch (error) { errors.push(error); response.writeHead(500); response.end(); }
+  });
+  const baseUrl = await runtime.listen(server);
+  const executor = createOpenCodeExecutor({ baseUrl, connection: { major: 2, headers: { authorization: "Basic synthetic-http" } }, environment: runtime.env, pollIntervalMs: 1, instructionMutationTimeoutMs: 100 });
+  runtime.defer(() => executor.stopAll(), "HTTP executor");
+  const controller = new AbortController();
+  const turn = executor.runTurn({ ...input, signal: controller.signal }).catch((error) => error);
+  await entered.promise;
+  controller.abort(new Error("cancel HTTP PUT"));
+  await turn;
+  assert.equal(present, false);
+  assert.equal(deletes, 1);
+  assert.deepEqual(JSON.parse(await readFile(pipaPaths(runtime.home).openCodeRecovery, "utf8")).records, []);
+  await executor.ready(runtime.workspace);
+  assert.deepEqual(errors, []);
+  wire.assertComplete();
+});
+
+test("v2 U2: foreign input observed in cleanup's projection is never session-interrupted", async (t) => {
+  const controller = new AbortController();
+  let admitted = false;
+  let polls = 0;
+  let foreignRunning = false;
+  let interrupts = 0;
+  const { executor, input, document, runtime, wire } = await fixture(t, "v2", { transport: async (url, init, next) => {
+    const pathname = new URL(url).pathname;
+    if (pathname.endsWith("/prompt")) { admitted = true; return next(url, init); }
+    if (pathname.endsWith("/interrupt")) {
+      interrupts += 1;
+      foreignRunning = false;
+      return new Response(JSON.stringify({ interrupted: true }), { headers: { "content-type": "application/json" } });
+    }
+    if (pathname.endsWith("/message") && admitted) {
+      polls += 1;
+      const page = structuredClone(document.routes.find((route) => route.path.endsWith("/message")).responses[2].json);
+      if (!interrupts) page.data.pop();
+      if (controller.signal.aborted) {
+        foreignRunning = true;
+        page.data.push({ id: "msg_foreign", type: "user", text: "external", time: { created: 4 } });
+      }
+      return new Response(JSON.stringify(page), { headers: { "content-type": "application/json" } });
+    }
+    return next(url, init);
+  } });
+  const turn = executor.runTurn({ ...input, signal: controller.signal }).catch((error) => error);
+  await waitFor(() => polls >= 2);
+  controller.abort(new Error("cancel active turn"));
+  await turn;
+  assert.equal(interrupts, 0);
+  assert.equal(foreignRunning, true);
+  assert.equal(JSON.parse(await readFile(pipaPaths(runtime.home).openCodeRecovery, "utf8")).records.length, 1);
+  wire.assertComplete();
+});
+
+test("v2 review: lost pending-cancel reply cannot hide promotion between inbox and message snapshots", async (t) => {
+  let admitted = false;
+  let promoted = false;
+  let cancellationSent = false;
+  let interrupted = false;
+  let polls = 0;
+  const controller = new AbortController();
+  const { executor, input, runtime, wire } = await fixture(t, "v2", { transport: async (url, init, next) => {
+    const pathname = new URL(url).pathname;
+    const json = (value) => new Response(JSON.stringify(value), { headers: { "content-type": "application/json" } });
+    if (pathname.endsWith("/prompt")) { admitted = true; return next(url, init); }
+    if (pathname.endsWith("/interrupt")) { interrupted = true; return json({ interrupted: true }); }
+    if (pathname.includes("/inbox/") && init.method === "DELETE") { cancellationSent = true; throw new TypeError("cancel reply lost before settlement"); }
+    if (pathname.endsWith("/inbox") && admitted) {
+      if (cancellationSent) promoted = true; // Atomic native promotion removes inbox row and appends the user message.
+      return json({ data: promoted ? [] : [{ id: "msg_input", sessionID: "ses_contract", type: "user" }] });
+    }
+    if (pathname.endsWith("/message") && admitted) {
+      polls += 1;
+      return json({ data: promoted ? [{ id: "msg_input", type: "user", text: input.prompt, time: { created: 2 } }, ...(interrupted ? [{ id: "msg_idle_cancel", type: "idle", outcome: "interrupted", time: { created: 3 } }] : [])] : [], cursor: { previous: null, next: null } });
+    }
+    return next(url, init);
+  } });
+  const turn = executor.runTurn({ ...input, signal: controller.signal }).catch((error) => error);
+  await waitFor(() => polls >= 2);
+  controller.abort(new Error("cancel pending input"));
+  await turn;
+  assert.equal(promoted, true);
+  assert.equal(interrupted, true, "promotion must settle through active cancellation, not disappear as a missing pending item");
+  assert.deepEqual(JSON.parse(await readFile(pipaPaths(runtime.home).openCodeRecovery, "utf8")).records, []);
+  wire.assertComplete();
+});
+
+test("v2 review: foreign admission between final poll and cleanup suppresses success even after own idle", async (t) => {
+  let admitted = false;
+  let polls = 0;
+  const { executor, input, document, runtime, wire } = await fixture(t, "v2", { transport: async (url, init, next) => {
+    const pathname = new URL(url).pathname;
+    if (pathname.endsWith("/prompt")) { admitted = true; return next(url, init); }
+    if (pathname.endsWith("/message") && admitted) {
+      const page = structuredClone(document.routes.find((route) => route.path.endsWith("/message")).responses[2].json);
+      if (++polls >= 2) page.data.push({ id: "msg_foreign_late", type: "user", text: "foreign writer", time: { created: 5 } });
+      return new Response(JSON.stringify(page), { headers: { "content-type": "application/json" } });
+    }
+    return next(url, init);
+  } });
+  await assert.rejects(executor.runTurn(input), /attribution conflict/u);
+  assert.deepEqual(JSON.parse(await readFile(pipaPaths(runtime.home).openCodeRecovery, "utf8")).records, [], "settled owned work/context can be cleaned despite attribution failure");
+  await executor.ready(runtime.workspace);
+  wire.assertComplete();
+});
+
+test("v2 review: the live watcher still detects foreign input during acknowledged context removal", async (t) => {
+  let stream;
+  let closed = false;
+  const { executor, input, runtime, wire } = await fixture(t, "v2", { transport: async (url, init, next) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/api/event") return new Response(new ReadableStream({ start(controller) {
+      stream = controller;
+      init.signal.addEventListener("abort", () => { closed = true; controller.close(); }, { once: true });
+    }, cancel() { closed = true; } }), { headers: { "content-type": "text/event-stream" } });
+    if (pathname.includes("/instructions/entries/") && init.method === "DELETE") {
+      if (!closed) stream.enqueue(new TextEncoder().encode('data: {"id":"evt_foreign_cleanup","type":"session.inbox.enqueued","data":{"sessionID":"ses_contract","inboxID":"msg_foreign"}}\n\n'));
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    return next(url, init);
+  } });
+  await assert.rejects(executor.runTurn(input), /attribution conflict/u);
+  assert.equal(closed, true);
+  assert.deepEqual(JSON.parse(await readFile(pipaPaths(runtime.home).openCodeRecovery, "utf8")).records, []);
+  await executor.ready(runtime.workspace);
+  wire.assertComplete();
+});
+
+test("v2 review: persistent attached-server refusal is bounded, authenticated, fatal once, and retains uncertain ownership", async (t) => {
+  let admitted = false;
+  const fatal = [];
+  const probes = [];
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error("test safety deadline")), 200);
+  t.after(() => clearTimeout(timer));
+  const { executor, input, runtime, wire } = await fixture(t, "v2", { executorOptions: { connection: { major: 2, headers: { authorization: "Basic synthetic-private" } }, connectionRecoveryTimeoutMs: 15, connectionProbeTimeoutMs: 10, cleanupTimeoutMs: 15, onFatal: (error) => fatal.push(error) }, transport: async (url, init, next) => {
+    const pathname = new URL(url).pathname;
+    if (pathname.endsWith("/prompt")) { admitted = true; return next(url, init); }
+    if (admitted && init.method === "GET" && pathname !== "/api/event") {
+      probes.push({ path: pathname, headers: init.headers });
+      throw new TypeError("ECONNREFUSED");
+    }
+    return next(url, init);
+  } });
+  await assert.rejects(executor.runTurn({ ...input, signal: controller.signal }));
+  assert.equal(controller.signal.aborted, false, "connection recovery must end before the test's safety deadline");
+  assert.equal(fatal.length, 1);
+  assert.match(fatal[0].message, /unavailable/u);
+  assert.ok(probes.length >= 2, "confirm loss through authoritative reads before fatal notification");
+  assert.ok(probes.every((probe) => new Headers(probe.headers).get("authorization") === "Basic synthetic-private"));
+  assert.equal(JSON.parse(await readFile(pipaPaths(runtime.home).openCodeRecovery, "utf8")).records.length, 1);
+  wire.assertComplete();
+});
+
+for (const confirmation of ["refused", "timeout", "healthy"]) test(`v2 fallback: cleanup-originated loss after successful idle confirms ${confirmation} independently before fatal notification`, async (t) => {
+  let admitted = false;
+  let idle = false;
+  let cleanupSignal;
+  let confirmed = false;
+  const fatal = [];
+  const probes = [];
+  const controller = new AbortController();
+  const { executor, input, runtime, wire } = await fixture(t, "v2", { executorOptions: {
+    connection: { major: 2, headers: { authorization: "Basic cleanup-private" } },
+    cleanupTimeoutMs: 15, connectionRecoveryTimeoutMs: 100, connectionProbeTimeoutMs: 5,
+    onFatal: (error) => fatal.push(error),
+  }, transport: async (url, init, next) => {
+    const pathname = new URL(url).pathname;
+    if (pathname.endsWith("/prompt")) { admitted = true; return next(url, init); }
+    if (idle && pathname !== "/api/event") {
+      assert.equal(init.method, "GET", "failed cleanup must not mutate or interrupt the attached server");
+      cleanupSignal ??= init.signal;
+      const independent = cleanupSignal.aborted && !init.signal.aborted;
+      probes.push({ independent, authorization: new Headers(init.headers).get("authorization") });
+      if (independent) {
+        confirmed = true;
+        if (confirmation === "healthy") return next(url, init);
+        if (confirmation === "timeout") return new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }));
+      }
+      throw new TypeError("cleanup ECONNREFUSED");
+    }
+    const response = await next(url, init);
+    if (admitted && pathname.endsWith("/message") && response.ok) {
+      const page = await response.clone().json();
+      idle = page.data.some((message) => message.type === "idle" && message.outcome === "succeeded");
+    }
+    return response;
+  } });
+  const safety = setTimeout(() => controller.abort(new Error("test safety deadline")), 500);
+  try { await assert.rejects(executor.runTurn({ ...input, signal: controller.signal }), /cleanup failed/u); }
+  finally { clearTimeout(safety); }
+  assert.equal(idle, true, "loss starts only after a successful execution projection");
+  assert.equal(controller.signal.aborted, false, "cleanup and confirmation must finish within their own bounded signals");
+  assert.equal(confirmed, true, "the shorter cleanup timeout must not bypass the fresh confirmation probe");
+  assert.ok(probes.every((probe) => probe.authorization === "Basic cleanup-private"));
+  assert.equal(fatal.length, confirmation === "healthy" ? 0 : 1);
+  if (fatal.length) assert.match(fatal[0].message, /unavailable/u);
+  assert.equal(JSON.parse(await readFile(pipaPaths(runtime.home).openCodeRecovery, "utf8")).records.length, 1);
+  await assert.rejects(executor.runTurn(input), /blocked/u);
+  assert.equal(fatal.length, confirmation === "healthy" ? 0 : 1);
+  wire.assertComplete();
+});
+
+for (const mode of ["short outage", "healthy long task"]) test(`v2 review: ${mode} is not a permanent connection failure`, async (t) => {
+  let admitted = false;
+  let polls = 0;
+  let fatal = 0;
+  const { executor, input, document, wire } = await fixture(t, "v2", { executorOptions: { connectionRecoveryTimeoutMs: 15, onFatal: () => { fatal += 1; } }, transport: async (url, init, next) => {
+    const pathname = new URL(url).pathname;
+    if (pathname.endsWith("/prompt")) { admitted = true; return next(url, init); }
+    if (pathname.endsWith("/message") && admitted) {
+      polls += 1;
+      if (mode === "short outage" && polls <= 3) throw new TypeError("brief connection loss");
+      const page = structuredClone(document.routes.find((route) => route.path.endsWith("/message")).responses[2].json);
+      if (mode === "healthy long task" && polls < 35) page.data.pop();
+      return new Response(JSON.stringify(page), { headers: { "content-type": "application/json" } });
+    }
+    return next(url, init);
+  } });
+  await runTurnContract({ executor, input, expected: document.expected });
+  assert.equal(fatal, 0);
+  assert.ok(polls >= (mode === "short outage" ? 4 : 35));
+  wire.assertComplete();
+});
+
+test("v2 review: temporary event connection refusal recovers before bounded subscription readiness", async (t) => {
+  let connections = 0;
+  let fatal = 0;
+  const { executor, input, document, wire } = await fixture(t, "v2", { executorOptions: { connectionRecoveryTimeoutMs: 50, onFatal: () => { fatal += 1; } }, transport: async (url, init, next) => {
+    if (new URL(url).pathname === "/api/event" && ++connections <= 2) throw new TypeError("brief stream refusal");
+    return next(url, init);
+  } });
+  await runTurnContract({ executor, input, expected: document.expected });
+  assert.equal(connections, 3);
+  assert.equal(fatal, 0);
+  wire.assertComplete();
+});
+
+test("v2 review: repeated lost admission replies are bounded without marking a healthy server unavailable", async (t) => {
+  const attempts = [];
+  let fatal = 0;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error("test safety deadline")), 200);
+  t.after(() => clearTimeout(timer));
+  const { executor, input, runtime, wire } = await fixture(t, "v2", { executorOptions: { connectionRecoveryTimeoutMs: 15, onFatal: () => { fatal += 1; } }, transport: async (url, init, next) => {
+    const pathname = new URL(url).pathname;
+    if (pathname.endsWith("/prompt")) { attempts.push(JSON.parse(init.body).id); throw new TypeError("admission reply lost"); }
+    if (pathname.endsWith("/message")) return new Response(JSON.stringify({ data: [], cursor: { previous: null, next: null } }), { headers: { "content-type": "application/json" } });
+    return next(url, init);
+  } });
+  await assert.rejects(executor.runTurn({ ...input, signal: controller.signal }), /blocked/u);
+  assert.equal(controller.signal.aborted, false);
+  assert.ok(attempts.length >= 2);
+  assert.deepEqual([...new Set(attempts)], ["msg_input"]);
+  assert.equal(fatal, 0);
+  assert.equal(JSON.parse(await readFile(pipaPaths(runtime.home).openCodeRecovery, "utf8")).records.length, 1);
+  wire.assertComplete();
+});
+
+test("v2 review: same-session reservation precedes callbacks/downloads and does not reserve other sessions", async (t) => {
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  let ids = 0;
+  const { executor, input, document, runtime, wire } = await fixture(t, "v2", { executorOptions: { inputId: () => ++ids === 1 ? "msg_independent_input" : "msg_input" } });
+  const other = JSON.parse(JSON.stringify(document).replaceAll("ses_contract", "ses_independent").replaceAll("msg_input", "msg_independent_input"));
+  document.routes.push(...other.routes.filter((route) => route.path.includes("ses_independent")));
+  const events = document.routes.find((route) => route.path === "/api/event");
+  events.responses.push(structuredClone(events.responses[0]));
+  const first = executor.runTurn({ ...input, onSession: async () => { entered.resolve(); await release.promise; } });
+  await entered.promise;
+  let downloaded = false;
+  let callback = false;
+  const second = await executor.runTurn({ ...input, attachments: [{ name: "race.txt", fetchData: async () => { downloaded = true; return Buffer.from("race"); } }], onSession: () => { callback = true; throw new Error("duplicate callback"); } }).catch((error) => error);
+  let independent;
+  try { independent = await executor.runTurn({ ...input, sessionId: "ses_independent" }); }
+  finally { release.resolve(); }
+  await first;
+  assert.match(second.message, /active writer/u);
+  assertTurnOutcome(independent, { ...document.expected, sessionId: "ses_independent" });
+  assert.equal(callback, false);
+  assert.equal(downloaded, false);
+  assert.deepEqual(await readdir(runtime.artifactRoot), []);
+  wire.assertComplete();
+});
+
+test("v2 U2: foreign input fails attribution and is never interrupted", async (t) => {
+  let admitted = false;
+  let deleted = false;
+  const { executor, input, document, runtime, wire } = await fixture(t, "v2", { transport: async (url, init, next) => {
+    const pathname = new URL(url).pathname;
+    assert.equal(pathname.endsWith("/interrupt"), false, "foreign execution must survive");
+    if (pathname.endsWith("/prompt")) { admitted = true; return next(url, init); }
+    if (pathname.includes("/instructions/entries/") && init.method === "DELETE") deleted = true;
+    if (pathname.endsWith("/message") && admitted) {
+      const result = structuredClone(document.routes.find((route) => route.path.endsWith("/message")).responses[2].json);
+      result.data.pop();
+      result.data.push({ id: "msg_foreign", type: "user", text: "external prompt", time: { created: 4 } });
+      return new Response(JSON.stringify(result), { headers: { "content-type": "application/json" } });
+    }
+    return next(url, init);
+  } });
+  await assert.rejects(executor.runTurn(input), /attribution conflict/u);
+  assert.equal(deleted, true);
+  assert.equal(JSON.parse(await readFile(pipaPaths(runtime.home).openCodeRecovery, "utf8")).records.length, 1);
+  await assert.rejects(executor.runTurn(input), /blocked/u);
+  wire.assertComplete();
+});
+
+test("v2 U2: failed context cleanup retains a private record, blocks intake, and startup reconciles an unbound routine session", async (t) => {
+  let failRemoval = true;
+  const current = await fixture(t, "v2", { transport: async (url, init, next) => {
+    if (new URL(url).pathname.includes("/instructions/entries/") && init.method === "DELETE" && failRemoval) return new Response(null, { status: 503 });
+    return next(url, init);
+  } });
+  const { executor, input, document, wire, runtime } = current;
+  await assert.rejects(executor.runTurn({ ...input, sessionId: null }), /cleanup failed/u);
+  const recoveryFile = pipaPaths(runtime.home).openCodeRecovery;
+  const saved = JSON.parse(await readFile(recoveryFile, "utf8"));
+  assert.equal(saved.records.length, 1);
+  assert.equal(saved.records[0].sessionId, document.expected.sessionId);
+  assert.equal(saved.records[0].phase, "admitted");
+  if (process.platform !== "win32") assert.equal((await stat(recoveryFile)).mode & 0o777, 0o600);
+  const admissions = wire.calls.filter((call) => call.path.endsWith("/prompt")).length;
+  await assert.rejects(executor.runTurn(input), /blocked/u);
+  assert.equal(wire.calls.filter((call) => call.path.endsWith("/prompt")).length, admissions);
+  failRemoval = false;
+  const restarted = createOpenCodeExecutor({ baseUrl: "http://127.0.0.1:4096", connection: { major: 2, headers: {} }, fetch: current.fetch, environment: runtime.env, pollIntervalMs: 1 });
+  await restarted.ready(runtime.workspace);
+  assert.deepEqual(JSON.parse(await readFile(recoveryFile, "utf8")).records, []);
+  assert.equal(wire.calls.filter((call) => call.path.endsWith("/prompt")).length, admissions, "startup must not replay work");
+  restarted.stopAll();
+  wire.assertComplete();
+});
+
+test("v2 U2: all authoritative message pages are read; a foreign admission hidden on page two prevents delivery", async (t) => {
+  for (const foreign of [false, true]) {
+    let admitted = false;
+    const pages = [];
+    const { executor, input, document, wire } = await fixture(t, "v2", { transport: async (url, init, next) => {
+      const parsed = new URL(url);
+      if (parsed.pathname.endsWith("/prompt")) { admitted = true; return next(url, init); }
+      if (parsed.pathname.endsWith("/message") && admitted) {
+        const completed = structuredClone(document.routes.find((route) => route.path.endsWith("/message")).responses[2].json);
+        const cursor = parsed.searchParams.get("cursor");
+        pages.push(cursor);
+        // 2.0.29's opaque cursor carries order; combining the two is HTTP 400.
+        if (cursor && parsed.searchParams.has("order")) return new Response(JSON.stringify({ _tag: "InvalidCursorError", message: "Cursor cannot be combined with order" }), { status: 400, headers: { "content-type": "application/json" } });
+        assert.equal(parsed.searchParams.get("order"), cursor ? null : "asc");
+        assert.equal(parsed.searchParams.get("limit"), "100");
+        if (!cursor) return new Response(JSON.stringify({ data: completed.data, cursor: { previous: null, next: "page-two" } }), { headers: { "content-type": "application/json" } });
+        assert.equal(cursor, "page-two");
+        return new Response(JSON.stringify({ data: foreign ? [{ id: "msg_external", type: "user", text: "foreign", time: { created: 5 } }] : [], cursor: { previous: "page-one", next: null } }), { headers: { "content-type": "application/json" } });
+      }
+      return next(url, init);
+    } });
+    if (foreign) await assert.rejects(executor.runTurn(input), /attribution conflict/u);
+    else await runTurnContract({ executor, input, expected: document.expected });
+    assert.deepEqual(pages, [null, "page-two", null, "page-two"]);
+    wire.assertComplete();
+  }
+});
+
+test("v2 U2: native cursor-only continuations read short pages through the empty tail before delivery and cleanup", async (t) => {
+  const pages = createWireFixture(JSON.parse(await readFile(new URL("./fixtures/opencode/v2/message-pages.json", import.meta.url), "utf8")));
+  let admitted = false;
+  const { executor, input, document, wire } = await fixture(t, "v2", { transport: async (url, init, next) => {
+    const pathname = new URL(url).pathname;
+    if (pathname.endsWith("/prompt")) admitted = true;
+    if (admitted && pathname.endsWith("/message")) return pages.fetch(url, init);
+    return next(url, init);
+  } });
+  await runTurnContract({ executor, input, expected: document.expected });
+  assert.deepEqual(pages.calls.map((call) => call.query), [0, 1].flatMap(() => [
+    { limit: "100", order: "asc" }, { limit: "100", cursor: "opaque-after-input" }, { limit: "100", cursor: "opaque-after-idle" },
+  ]));
+  pages.assertComplete();
+  wire.assertComplete();
+});
+
+for (const outcome of ["failed", "interrupted"]) test(`v2 U2: terminal ${outcome} projection cannot deliver even with successful-looking assistant text`, async (t) => {
+  const { executor, input, document, wire } = await fixture(t, "v2");
+  document.routes.find((route) => route.path.endsWith("/message")).responses[2].json.data.at(-1).outcome = outcome;
+  await assert.rejects(executor.runTurn(input), /failed to complete/u);
+  wire.assertComplete();
+});
+
+test("U2: session persistence callback runs before artifact allocation, context writes or admission on either generation", async (t) => {
+  for (const generation of ["v1", "v2"]) {
+    const { executor, input, wire, runtime } = await fixture(t, generation);
+    await assert.rejects(executor.runTurn({ ...input, contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack" }, onSession: async () => {
+      assert.deepEqual(await readdir(runtime.artifactRoot), []);
+      throw new Error("session persistence failed");
+    } }), /session persistence failed/u);
+    assert.equal(wire.calls.some((call) => call.method !== "GET"), false);
+    await assert.rejects(access(pipaPaths(runtime.home).openCodeRecovery), { code: "ENOENT" });
+    wire.assertComplete();
+  }
+});
+
+for (const generation of ["v1", "v2"]) for (const remote of [false, true]) test(`${generation} U2: 10 MiB decoded input boundary, metadata, multiple Unicode files and ${remote ? "data URI" : "local file"} transport`, async (t) => {
+  const { executor, input, document, wire } = await fixture(t, generation, { executorOptions: { baseUrl: remote ? "https://remote.fixture" : "http://127.0.0.1:4096" }, onRequest: async (call) => {
+    if (remote || !call.path.endsWith(generation === "v1" ? "/prompt_async" : "/prompt")) return;
+    const urls = generation === "v1" ? call.body.parts.slice(1).map((file) => file.url) : call.body.files.map((file) => file.uri);
+    assert.deepEqual(await readFile(new URL(urls[0])), bytes);
+    assert.equal(await readFile(new URL(urls[1]), "utf8"), "two");
+  } });
+  let downloaded = false;
+  await assert.rejects(executor.runTurn({ ...input, attachments: [{ size: 10 * 1024 * 1024 + 1, fetchData: () => { downloaded = true; } }] }), /10 MiB/u);
+  assert.equal(downloaded, false);
+  await assert.rejects(executor.runTurn({ ...input, attachments: [{ size: 1, fetchData: async () => Buffer.alloc(10 * 1024 * 1024 + 1) }] }), /10 MiB/u);
+  assert.equal(wire.calls.length, 0, "oversized files cannot reach admission");
+  const bytes = Buffer.alloc(10 * 1024 * 1024, 97);
+  const route = document.routes.find((route) => route.path.endsWith(generation === "v1" ? "/prompt_async" : "/prompt"));
+  if (generation === "v2") delete route.body; // The exact native files are asserted below, alongside unchanged exact prompt bytes.
+  await runTurnContract({ executor, input: { ...input, attachments: [
+    { name: "café😀.txt", size: bytes.length, mimeType: "text/plain", fetchData: async () => bytes },
+    { name: "second.txt", mimeType: "text/plain", fetchData: async () => Buffer.from("two") },
+  ] }, expected: document.expected });
+  const body = wire.calls.find((call) => call.path === route.path).body;
+  assert.equal(generation === "v1" ? body.parts[0].text : body.text, document.prompt);
+  const files = generation === "v1" ? body.parts.slice(1).map((part) => ({ uri: part.url, name: part.filename })) : body.files;
+  assert.deepEqual(files.map((file) => file.name), ["café😀.txt", "second.txt"]);
+  for (const [index, file] of files.entries()) {
+    if (remote) {
+      assert.equal(file.uri.startsWith("data:"), true);
+      const data = Buffer.from(file.uri.split(",")[1], "base64");
+      assert.deepEqual(data, index === 0 ? bytes : Buffer.from("two"));
+      if (index === 0) assert.ok(Buffer.byteLength(file.uri) > bytes.length, "base64 overhead does not reduce the decoded limit");
+    } else await assert.rejects(access(new URL(file.uri)), { code: "ENOENT" });
+  }
+  wire.assertComplete();
+});
+
+test("U2: outgoing artifacts larger than the incoming limit remain deliverable through both adapters", async (t) => {
+  for (const generation of ["v1", "v2"]) {
+    let artifactDirectory;
+    const bytes = Buffer.alloc(20 * 1024 * 1024 + 1, 98);
+    const { executor, input, document, wire } = await fixture(t, generation, { onRequest: async (call) => {
+      const instructions = generation === "v1" ? call.body?.system : call.method === "PUT" ? call.body?.value : null;
+      if (!instructions) return;
+      artifactDirectory = instructions.match(/private artifact directory: (.+)\n/u)[1];
+      await writeFile(path.join(artifactDirectory, "large.txt"), bytes);
+      const response = document.routes.find((route) => route.path.endsWith("/message")).responses[generation === "v1" ? 1 : 2].json;
+      const content = generation === "v1" ? response[0].parts : response.data[1].content;
+      content.at(-1).text += '\nPIPA_ARTIFACTS: ["large.txt"]';
+    } });
+    await runTurnContract({ executor, input: { ...input, contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack" } }, expected: { ...document.expected, files: [{ filename: "large.txt", base64: bytes.toString("base64") }] } });
+    await assert.rejects(access(artifactDirectory), { code: "ENOENT" });
+    wire.assertComplete();
+  }
+});
+
+for (const instruction of ["putting", "present"]) test(`v2 U2: SIGKILL with instruction ${instruction} recovers owned context without routine admission`, async (t) => {
+  const { runtime, fetch: nativeFetch, wire } = await fixture(t, "v2");
+  const registered = path.join(runtime.state, "registered.json");
+  const production = new URL("../src/opencode.mjs", import.meta.url).href;
+  const child = runtime.spawn(process.execPath, ["--input-type=module", "-e", `
+    import { createOpenCodeExecutor } from ${JSON.stringify(production)};
+    import { writeFile, readFile } from 'node:fs/promises';
+    let installedBody;
+    const checkpoint = async body => {
+      const saved = JSON.parse(await readFile(${JSON.stringify(pipaPaths(runtime.home).openCodeRecovery)}, 'utf8'));
+      await writeFile(${JSON.stringify(registered)}, JSON.stringify({ saved, body }));
+      setInterval(() => {}, 1000);
+      return new Promise(() => {});
+    };
+    const executor = createOpenCodeExecutor({ baseUrl: 'http://127.0.0.1:4096', connection: { major: 2, headers: {} }, environment: process.env, fetch: async (url, init) => {
+      const pathname = new URL(url).pathname;
+      const json = value => new Response(JSON.stringify(value), { headers: { 'content-type': 'application/json' } });
+      if (pathname === '/api/session') return json({ data: { id: 'ses_contract', location: { directory: process.cwd() } } });
+      if (pathname.endsWith('/message')) return json({ data: [], cursor: { previous: null, next: null } });
+      if (pathname.endsWith('/inbox')) {
+        if (installedBody) return checkpoint(installedBody);
+        return json({ data: [] });
+      }
+      if (pathname.endsWith('/active')) return json({ data: {} });
+      if (pathname === '/api/event') return new Response(new ReadableStream({ start(c) { init.signal.addEventListener('abort', () => c.close(), { once: true }); } }), { headers: { 'content-type': 'text/event-stream' } });
+      if (pathname.includes('/instructions/entries/') && init.method === 'PUT') {
+        if (${JSON.stringify(instruction)} === 'putting') return checkpoint(JSON.parse(init.body));
+        installedBody = JSON.parse(init.body);
+        return new Response(null, { status: 204 });
+      }
+      throw new Error('Unexpected native request: ' + pathname);
+    } });
+    await executor.runTurn({ prompt: 'exact routine prompt', workingDirectory: process.cwd() });
+  `]);
+  const observed = JSON.parse(await runtime.waitFor(() => readFile(registered, "utf8").catch((error) => { if (error.code === "ENOENT") return false; throw error; })));
+  assert.equal(observed.saved.records[0].phase, "prepared");
+  assert.equal(observed.saved.records[0].instruction, instruction);
+  assert.match(observed.body.value, /pipa routine --help/u);
+  child.child.kill("SIGKILL");
+  await child.exited;
+  const restarted = createOpenCodeExecutor({ baseUrl: "http://127.0.0.1:4096", connection: { major: 2, headers: {} }, fetch: nativeFetch, environment: runtime.env, pollIntervalMs: 1 });
+  await restarted.ready(runtime.workspace);
+  assert.deepEqual(JSON.parse(await readFile(pipaPaths(runtime.home).openCodeRecovery, "utf8")).records, []);
+  assert.equal(wire.calls.some((call) => call.path.endsWith("/prompt")), false);
+  assert.deepEqual(wire.calls.filter((call) => call.method === "DELETE").map((call) => call.path.split("/").at(-1)), [observed.saved.records[0].key]);
+  restarted.stopAll();
+  wire.assertComplete();
+});
+
+for (const lostResponse of [false, true]) test(`v2 U2: cancellation removes only the owned pending input with foreign input queued (lost response: ${lostResponse})`, async (t) => {
+  let admitted = false;
+  let cancelled = false;
+  const { executor, input, runtime, wire } = await fixture(t, "v2", { transport: async (url, init, next) => {
+    const parsed = new URL(url);
+    const json = (value) => new Response(JSON.stringify(value), { headers: { "content-type": "application/json" } });
+    if (parsed.pathname.endsWith("/prompt")) { admitted = true; return next(url, init); }
+    assert.equal(parsed.pathname.endsWith("/interrupt"), false);
+    if (parsed.pathname.includes("/inbox/") && init.method === "DELETE") {
+      assert.equal(parsed.pathname.split("/").at(-1), "msg_input");
+      assert.equal(init.signal.aborted, false);
+      cancelled = true;
+      if (lostResponse) throw new TypeError("lost cancellation response");
+      return new Response(null, { status: 204 });
+    }
+    if (parsed.pathname.endsWith("/inbox") && admitted) return json({ data: [
+      ...(!cancelled ? [{ id: "msg_input", sessionID: "ses_contract", type: "user" }] : []),
+      { id: "msg_foreign", sessionID: "ses_contract", type: "user" },
+    ] });
+    if (parsed.pathname.endsWith("/message") && admitted) return json({ data: [], cursor: { previous: null, next: null } });
+    return next(url, init);
+  } });
+  await assert.rejects(executor.runTurn(input), /attribution conflict/u);
+  assert.equal(cancelled, true);
+  assert.deepEqual(JSON.parse(await readFile(pipaPaths(runtime.home).openCodeRecovery, "utf8")).records, []);
+  wire.assertComplete();
+});
+
+test("U2: missing message/location routes cannot replace an existing session on either adapter", async (t) => {
+  for (const generation of ["v1", "v2"]) {
+    const { executor, input, document, wire } = await fixture(t, generation, { transport: async (url, init, next) => {
+      if (new URL(url).pathname.endsWith("/message")) return new Response(JSON.stringify({ _tag: "MessageNotFoundError", message: "missing projection" }), { status: 404, headers: { "content-type": "application/json" } });
+      return next(url, init);
+    } });
+    if (generation === "v1") document.routes.push({ method: "GET", path: "/session/ses_contract", query: { directory: input.workingDirectory }, responses: [{ json: { id: "ses_contract", directory: input.workingDirectory } }], required: true });
+    await assert.rejects(executor.runTurn(input));
+    assert.equal(wire.calls.some((call) => call.method === "POST"), false);
+    wire.assertComplete();
+  }
+});
+
+test("v2 U2: only a session-specific absent lookup permits stale-session replacement", async (t) => {
+  for (const tag of ["SessionNotFoundError", "LocationNotFoundError"]) {
+    const { executor, input, document, wire } = await fixture(t, "v2", { transport: async (url, init, next) => {
+      if (new URL(url).pathname === "/api/session/ses_missing") return new Response(JSON.stringify({ _tag: tag, sessionID: "ses_missing", message: "not found" }), { status: 404, headers: { "content-type": "application/json" } });
+      return next(url, init);
+    } });
+    if (tag === "SessionNotFoundError") await runTurnContract({ executor, input: { ...input, sessionId: "ses_missing" }, expected: document.expected });
+    else await assert.rejects(executor.runTurn({ ...input, sessionId: "ses_missing" }), /not found/u);
+    assert.equal(wire.calls.some((call) => call.method === "POST" && call.path === "/api/session"), tag === "SessionNotFoundError");
+    wire.assertComplete();
+  }
+});
+
+test("v2 U2: transient projection and event-stream loss reconcile without another admission", async (t) => {
+  let admitted = false;
+  let lostProjection = false;
+  let streams = 0;
+  const { executor, input, document, wire } = await fixture(t, "v2", { transport: async (url, init, next) => {
+    const pathname = new URL(url).pathname;
+    if (pathname.endsWith("/prompt")) { admitted = true; return next(url, init); }
+    if (pathname === "/api/event") {
+      streams += 1;
+      // A finite live stream has no retained terminal event to replay.
+      return new Response("data: {\"id\":\"evt_connected\",\"created\":1,\"type\":\"server.connected\",\"data\":{}}\n\n", { headers: { "content-type": "text/event-stream" } });
+    }
+    if (admitted && pathname.endsWith("/message") && !lostProjection) { lostProjection = true; throw new TypeError("transient projection loss"); }
+    return next(url, init);
+  } });
+  await runTurnContract({ executor, input, expected: document.expected });
+  assert.equal(lostProjection, true);
+  assert.ok(streams >= 1);
+  assert.equal(wire.calls.filter((call) => call.path.endsWith("/prompt")).length, 1);
+  wire.assertComplete();
+});
+
+test("v2 U2: hung cleanup is bounded and retains its ownership journal", async (t) => {
+  const { executor, input, runtime, wire } = await fixture(t, "v2", { executorOptions: { cleanupTimeoutMs: 20 }, transport: async (url, init, next) => {
+    if (new URL(url).pathname.includes("/instructions/entries/") && init.method === "DELETE") return new Promise((_, reject) => {
+      assert.equal(init.signal.aborted, false);
+      init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+    });
+    return next(url, init);
+  } });
+  const started = Date.now();
+  await assert.rejects(executor.runTurn(input), /cleanup failed/u);
+  assert.ok(Date.now() - started < 1_000);
+  assert.equal(JSON.parse(await readFile(pipaPaths(runtime.home).openCodeRecovery, "utf8")).records.length, 1);
+  wire.assertComplete();
+});
+
+test("v2 U2: continuation uses new input identity, preserves history, and removes prior Slack context", async (t) => {
+  let admitted = 0;
+  let ids = 0;
+  const instructions = [];
+  const { executor, input, document, wire, runtime } = await fixture(t, "v2", {
+    executorOptions: { inputId: () => ++ids === 1 ? "msg_input" : "msg_next" },
+    transport: async (url, init, next) => {
+      const pathname = new URL(url).pathname;
+      if (init.method === "PUT") instructions.push(JSON.parse(init.body).value);
+      if (pathname.endsWith("/prompt")) admitted += 1;
+      if (pathname.endsWith("/message") && admitted) {
+        const page = structuredClone(document.routes.find((route) => route.path.endsWith("/message")).responses[2].json);
+        if (admitted === 2) page.data.push(
+          { id: "msg_next", type: "user", text: "continue", time: { created: 5 } },
+          { ...page.data[1], id: "msg_followup", time: { created: 6, completed: 7 }, content: [{ type: "text", text: "history retained" }] },
+          { id: "msg_next_idle", type: "idle", time: { created: 8 }, outcome: "succeeded" });
+        return new Response(JSON.stringify(page), { headers: { "content-type": "application/json" } });
+      }
+      return next(url, init);
+    },
+  });
+  await runTurnContract({ executor, input: { ...input, contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack", PIPA_CURRENT_SLACK_CHANNEL_ID: "C1", PIPA_CURRENT_SLACK_THREAD_TS: "1.0" } }, expected: document.expected });
+  const prompt = document.routes.find((route) => route.path.endsWith("/prompt"));
+  prompt.repeatLast = true;
+  prompt.body = { id: "msg_next", text: "continue" };
+  prompt.responses[0].json.data.id = "msg_next";
+  prompt.responses[0].json.data.payload.text = "continue";
+  document.routes.find((route) => route.path === "/api/event").responses.push(structuredClone(document.routes.find((route) => route.path === "/api/event").responses[0]));
+  await runTurnContract({ executor, input: { ...input, prompt: "continue" }, expected: document.continuation });
+  assert.equal(wire.calls.some((call) => call.path === "/api/session"), false);
+  assert.match(instructions[0], /PIPA_CURRENT_SLACK_CHANNEL_ID=C1/u);
+  assert.match(instructions[0], /pipa restart --channel C1 --thread 1\.0/u);
+  assert.doesNotMatch(instructions[1], /PIPA_CURRENT_SLACK_CHANNEL_ID=C1|--channel C1/u);
+  assert.deepEqual(JSON.parse(await readFile(pipaPaths(runtime.home).openCodeRecovery, "utf8")).records, []);
+  assert.equal(wire.calls.filter((call) => call.method === "DELETE").length, 2);
+  wire.assertComplete();
 });
 
 test("isolated concurrent roots: abort closes process trees, listeners, locks and staging", async (t) => {
@@ -350,6 +1228,19 @@ test("private child environment excludes synthetic Slack secrets and ambient int
   const observed = JSON.parse(evidence);
   assert.equal(observed.CUSTOM_MCP_KEY, "synthetic-integration");
   for (const key of ["HOME", "USERPROFILE", "PIPA_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "TMPDIR", "TMP", "TEMP", "APPDATA", "LOCALAPPDATA", "ProgramData", "OPENCODE_DB", "OPENCODE_CONFIG"]) assert.ok(observed[key].startsWith(runtime.root + path.sep), key);
+});
+
+test("private fixture preserves the explicitly prepared production child environment", async (t) => {
+  const runtime = await createRuntimeFixture();
+  t.after(() => runtime.teardown());
+  const env = cleanChildEnvironment({ ...runtime.env, BUN_JSC_maxRegExpStackSize: "536870912", PIPA_SLACK_BOT_TOKEN: "synthetic-secret" });
+  const childFile = path.join(runtime.workspace, "prepared-environment.json");
+  const { exited } = runtime.spawn(process.execPath, ["-e", "require('node:fs').writeFileSync(process.argv[1], JSON.stringify(process.env))", childFile], { env });
+  assert.equal((await exited).code, 0);
+  const observed = JSON.parse(await readFile(childFile, "utf8"));
+  assert.equal(observed.BUN_JSC_maxRegExpStackSize, "536870912");
+  assert.equal(observed.PIPA_SLACK_BOT_TOKEN, undefined);
+  assert.equal(observed.HOME, runtime.home);
 });
 
 test("isolated production attachment/artifact turn uses private HOME/temp and removes staged files", async (t) => {

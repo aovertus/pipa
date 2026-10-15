@@ -59,7 +59,9 @@ export function createWireFixture(document, { onRequest } = {}) {
       init.signal?.throwIfAborted();
       const parsed = new URL(url);
       const method = init.method ?? "GET";
-      const route = document.routes.find((route) => route.method === method && route.path === parsed.pathname);
+      const candidates = document.routes.filter((route) => route.method === method && route.path === parsed.pathname);
+      const route = candidates.find((route) => Object.keys(route.query ?? {}).length === parsed.searchParams.size
+        && Object.entries(route.query ?? {}).every(([key, value]) => parsed.searchParams.get(key) === value)) ?? candidates[0];
       assert.ok(route, `${document.generation}: unknown wire request ${method} ${parsed.pathname}`);
       assert.deepEqual(Object.fromEntries(parsed.searchParams), route.query ?? {}, `${document.generation}: ${route.path}: query`);
       const body = init.body ? JSON.parse(init.body) : undefined;

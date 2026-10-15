@@ -43,6 +43,7 @@
   "dependencies": {
     "@chat-adapter/slack": "4.38.1",
     "@chat-adapter/state-memory": "4.38.1",
+    "@opencode/client": "2.0.29",
     "chat": "4.38.1",
     "cross-spawn": "7.0.6",
     "luxon": "3.7.2"

@@ -45,8 +45,8 @@ export const releaseCases = [
   caseOf("crash-after-completion", "Abrupt crash/recovery", "Death after engine completion before delivery retains history without automatic replay/redelivery", "U2/U6"),
   caseOf("plugin-reload-contract", "MCP/skills/agents/commands/plugins", "Modified private plugin executes its new hook once after native location reload", "U7"),
   caseOf("attachment-image-data-uri", "Incoming attachments", "Native engine receives exact image and document bytes via local and data URI transport", "U2"),
-  caseOf("attachment-20mib", "Incoming attachments", "Real 20 MiB attachment reaches native admission", "U2"),
-  caseOf("attachment-over-limit", "Incoming attachments", "20 MiB + 1 is rejected before native admission, both metadata and decoded bytes", "U2"),
+  caseOf("attachment-10mib", "Incoming attachments", "Real 10 MiB attachment reaches native admission through local and data URI transport", "U2"),
+  caseOf("attachment-over-limit", "Incoming attachments", "10 MiB + 1 is rejected before native admission, both metadata and decoded bytes", "U2"),
   caseOf("attachment-over-limit-metadata", "Incoming attachments", "Oversized Chat attachment metadata rejects without downloading or admitting work", "U2", chatCase),
   caseOf("artifact-limits-fallback", "Outgoing artifacts", "Over-20-MiB outgoing file retains R9; unsafe declarations upload nothing; failed file post falls back once without declaration", "U2/U7"),
   caseOf("question-multi-custom-dismiss", "Permissions/questions", "Real multiple choice, custom modal answer and dismissal settle through production handlers", "U3", chatCase),
@@ -237,10 +237,14 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
     OPENCODE_PASSWORD: "synthetic-loopback-only", OPENCODE_SERVER_PASSWORD: "synthetic-loopback-only", OPENCODE_LOG_LEVEL: "ERROR",
     PIPA_INTEGRATION_SENTINEL: "matrix-integration", npm_config_cache: path.join(runtime.cache, "npm"),
   });
+  // Attached servers are independently launched by this harness, not by Pipa.
+  // Match the documented v2 server configuration; owned startup must supply its own default.
+  if (pin.startsWith("2.") && mode === "attached") runtime.env.BUN_JSC_maxRegExpStackSize = "536870912";
   Object.assign(process.env, runtime.env);
   const load = (file) => import(pathToFileURL(path.join(candidate, "src", `${file}.mjs`)).href);
   const [appModule, facade, state, routines, restart] = await Promise.all(["app", "opencode", "state", "routines", "restart"].map(load));
   const cell = { cases: [], adapterSelected: null, clientVersion: null, client: "Production native fetch facade", engineReported: null, migrationRequested: migration, ...(caseIds ? { collection: "targeted-diagnostic", caseSelection: caseIds } : {}), evidence: {} };
+  if (runtime.env.BUN_JSC_maxRegExpStackSize) cell.evidence.serverRegexStackBytes = Number(runtime.env.BUN_JSC_maxRegExpStackSize);
   const cli = path.join(candidate, "bin", "pipa.mjs");
   const paths = state.pipaPaths(runtime.home);
   runtime.defer(async () => {
@@ -254,6 +258,11 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
   const provider = await createProvider(runtime);
   const definitions = await writeDefinitions(runtime, `DEFINITION_${randomUUID()}`);
   const engineConfig = { ...providerConfig(provider.url), mcp: definitions.mcp, plugin: definitions.plugin };
+  // Exact-size plaintext attachment qualification must not hit this finite
+  // provider fixture's ordinary 64k context and enter compaction before inference.
+  if (!caseIds || caseIds.includes("attachment-10mib")) {
+    for (const model of Object.values(engineConfig.provider.matrix.models)) model.limit.context = 16_000_000;
+  }
   await writeFile(runtime.env.OPENCODE_CONFIG, JSON.stringify(engineConfig));
   const headers = { authorization: `Basic ${Buffer.from("opencode:synthetic-loopback-only").toString("base64")}` };
   const chat = fakeChat();
@@ -747,21 +756,30 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
         } finally { if (remote !== executor) remote.stopAll(); }
       }
     },
-    "attachment-20mib": async () => {
+    "attachment-10mib": async () => {
       if (requireExecutor()) return requireExecutor();
-      const bytes = Buffer.alloc(20 * 1024 * 1024, 97);
-      const result = await turn("boundary-accepted", { attachments: [{ name: "boundary.txt", mimeType: "text/plain", fetchData: async () => bytes }] });
-      assertTurnOutcome(result, { sessionId: result.sessionId, text: textFor("boundary-accepted") });
-      assert.equal(inputReceipt(promptFor("boundary-accepted")).files[0].base64, bytes.toString("base64"));
+      const bytes = Buffer.alloc(10 * 1024 * 1024, 97);
+      for (const transport of ["local", "data-uri"]) {
+        const remote = transport === "data-uri" ? facade.createOpenCodeExecutor({ baseUrl: baseUrl.replace("127.0.0.1", "matrix.invalid"), environment: runtime.env, pollIntervalMs: 50,
+          fetch: (url, init) => connectedFetch(url instanceof Request ? new Request(url.url.replace("matrix.invalid", "127.0.0.1"), url) : String(url).replace("matrix.invalid", "127.0.0.1"), init) }) : executor;
+        try {
+          const id = `boundary-accepted-${transport}`;
+          const result = await turn(id, { attachments: [{ name: "boundary.txt", size: bytes.length, mimeType: "text/plain", fetchData: async () => bytes }] }, {}, remote);
+          assertTurnOutcome(result, { sessionId: result.sessionId, text: textFor(id) });
+          const file = inputReceipt(promptFor(id)).files[0];
+          assert.equal(file.base64, bytes.toString("base64"));
+          if (transport === "data-uri") assert.notEqual(file.transport, "local");
+        } finally { if (remote !== executor) remote.stopAll(); }
+      }
     },
     "attachment-over-limit": async () => {
       if (requireExecutor()) return requireExecutor();
-      const bytes = Buffer.alloc(20 * 1024 * 1024 + 1, 97);
+      const bytes = Buffer.alloc(10 * 1024 * 1024 + 1, 97);
       let failure;
       try { await turn("boundary-rejected", { attachments: [{ name: "oversized.txt", mimeType: "text/plain", fetchData: async () => bytes }] }); }
       catch (error) { failure = error; }
-      assert.ok(failure, "Current product accepted 20 MiB + 1 decoded bytes instead of enforcing R8");
-      assert.match(failure.message, /20.*MiB|too large|smaller/iu, `Oversized input failed for an unrelated reason: ${failure.message}`);
+      assert.ok(failure, "Current product accepted 10 MiB + 1 decoded bytes instead of enforcing R8");
+      assert.match(failure.message, /10.*MiB|too large|smaller/iu, `Oversized input failed for an unrelated reason: ${failure.message}`);
       assertNativeAdmissionCount(wires, promptFor("boundary-rejected"), 0);
     },
     "attachment-over-limit-metadata": async () => {
@@ -770,10 +788,10 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
       provider.register({ prompt: promptFor(id), text: textFor(id) });
       let downloaded = false;
       const thread = "slack:CMATRIX:410.001";
-      chat.send(thread, promptFor(id), true, {}, [{ name: "oversized.txt", size: 20 * 1024 * 1024 + 1, mimeType: "text/plain", fetchData: async () => { downloaded = true; return Buffer.from("small bytes behind oversized metadata"); } }]);
+      chat.send(thread, promptFor(id), true, {}, [{ name: "oversized.txt", size: 10 * 1024 * 1024 + 1, mimeType: "text/plain", fetchData: async () => { downloaded = true; return Buffer.from("small bytes behind oversized metadata"); } }]);
       await runtime.waitFor(() => chat.posts.some((post) => post.thread === thread), { timeoutMs: 15000 });
       assert.equal(downloaded, false, "Current product downloaded an attachment above R8 metadata limit");
-      assert.match(JSON.stringify(chat.posts.find((post) => post.thread === thread).content), /20.*MiB/u);
+      assert.match(JSON.stringify(chat.posts.find((post) => post.thread === thread).content), /10.*MiB/u);
       assertNativeAdmissionCount(wires, promptFor(id), 0);
     },
     "reconnect-stream": async () => {
@@ -832,11 +850,15 @@ export async function runCell({ candidate, pin, mode, migration = false, caseIds
       const bytes = Buffer.from(`matrix artifact café\n${nonce}\n`);
       const result = await turn("artifact", { contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack", PIPA_CURRENT_SLACK_CHANNEL_ID: "CMATRIX", PIPA_CURRENT_SLACK_THREAD_TS: "400.001" } }, {
         text: `${textFor("artifact")}\nPIPA_ARTIFACTS: ["result.txt"]`,
-        tool: { names: ["write"], arguments: (messages) => {
+        tool: { names: ["write"], arguments: (messages, tool) => {
           const system = messages.filter((item) => item.role === "system").map((item) => item.content).join("\n");
           const directory = system.match(/private artifact directory: ([^\n]+)/u)?.[1];
           assert.ok(directory, "Production artifact context missing");
-          return { filePath: path.join(directory, "result.txt"), content: bytes.toString() };
+          // Native v2 write uses `path`; v1 uses `filePath`. Select from the
+          // actual tool schema, keeping the delivered-byte assertion unchanged.
+          const key = tool.parameters.properties.path ? "path" : "filePath";
+          assert.ok(tool.parameters.properties[key], "Native write tool has no supported path field");
+          return { [key]: path.join(directory, "result.txt"), content: bytes.toString() };
         } },
       });
       assertTurnOutcome(result, { sessionId: result.sessionId, text: textFor("artifact"), files: [{ filename: "result.txt", base64: bytes.toString("base64") }] });

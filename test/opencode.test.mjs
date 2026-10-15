@@ -7,15 +7,20 @@ import { PassThrough } from "node:stream";
 import test from "node:test";
 import {
   cleanChildEnvironment,
-  createOpenCodeExecutor,
+  createOpenCodeExecutor as createExecutor,
   OpenCodeReadinessError,
   parseOpenCodeVersion,
   MAX_ATTACHMENT_BYTES,
+  MAX_ARTIFACT_BYTES,
   PipaStoppedError,
   runOpenCodeVersion,
   startOpenCodeServer,
   startSocketOpenCodeServer,
 } from "../src/opencode.mjs";
+
+// Execution fixtures below characterize v1 after U1 negotiation. The shared
+// contract suite independently exercises standalone automatic negotiation.
+const createOpenCodeExecutor = (options) => createExecutor({ connection: { major: 1 }, ...options });
 
 test("removes Slack credentials from child environments regardless of casing", () => {
   assert.deepEqual(cleanChildEnvironment({
@@ -101,14 +106,14 @@ for (const state of ["required", "running", "error"]) test(`U1 v2 migration ${st
   assert.equal(locations, 0);
 });
 
-test("U1 owned version preflight chooses v2 launch settings, private auth and catches mismatch", async () => {
-  for (const mismatch of [false, true]) {
+test("owned v2 launch preserves regex-stack overrides, supports 10 MiB, authenticates and catches mismatch", async () => {
+  for (const regexStack of [undefined, "805306368"]) for (const mismatch of [false, true]) {
     const child = childProcess();
     let invocation;
     let killed = false;
     child.kill = () => { killed = true; queueMicrotask(() => child.emit("close", 0)); return true; };
     const starting = startSocketOpenCodeServer({ workingDirectory: "/work" }, {
-      environment: { PIPA_SLACK_BOT_TOKEN: "secret" }, checkOpenCode: async () => "OpenCode 2.0.29",
+      environment: { PIPA_SLACK_BOT_TOKEN: "secret", ...(regexStack ? { BUN_JSC_maxRegExpStackSize: regexStack } : {}) }, checkOpenCode: async () => "OpenCode 2.0.29",
       spawn: (command, args, options) => { invocation = { args, options }; queueMicrotask(() => child.stdout.write("http://127.0.0.1:5555\n")); return child; },
       fetch: async (url, init) => {
         assert.equal(init.headers.authorization, `Basic ${Buffer.from(`opencode:${invocation.options.env.OPENCODE_PASSWORD}`).toString("base64")}`);
@@ -123,6 +128,7 @@ test("U1 owned version preflight chooses v2 launch settings, private auth and ca
     else {
       const server = await starting;
       assert.ok(invocation.options.env.OPENCODE_PASSWORD.length >= 32);
+      assert.equal(invocation.options.env.BUN_JSC_maxRegExpStackSize, regexStack ?? "536870912");
       assert.equal(invocation.options.env.PIPA_SLACK_BOT_TOKEN, undefined);
       assert.deepEqual(invocation.args, ["serve", "--hostname", "127.0.0.1", "--port", "0", "--log-level", "error"]);
       assert.equal(server.connection.major, 2);
@@ -445,6 +451,7 @@ test("replaces a stale persisted session only after a successful turn", async ()
   const fetch = async (url, init = {}) => {
     const pathname = new URL(url).pathname;
     if (pathname === "/session/ses_stale/message") return jsonResponse({ error: "not found" }, 404);
+    if (pathname === "/session/ses_stale") return jsonResponse({ error: "not found" }, 404);
     if (pathname === "/session" && init.method === "POST") return jsonResponse({ id: "ses_new" });
     if (pathname === "/session/ses_new/message") {
       return jsonResponse(prompted ? [{ info: { id: "new", role: "assistant", time: { completed: 1 } }, parts: [{ type: "text", text: "recovered" }] }] : []);
@@ -588,7 +595,7 @@ test("preserves attachment validation and cleanup", async () => {
     prompt: "summarize",
     workingDirectory: "/work",
     attachments: [{ name: "large.bin", fetchData: async () => ({ byteLength: MAX_ATTACHMENT_BYTES + 1 }) }],
-  }), /100 MB or smaller/u);
+  }), /10 MiB or smaller/u);
   assert.equal(requested, false);
 });
 
@@ -1261,7 +1268,7 @@ test("artifact reads reject symlinks, directories, missing files, and clean thei
 });
 
 test("artifact reads enforce per-file and aggregate 100 MB limits", async () => {
-  for (const sizes of [[MAX_ATTACHMENT_BYTES + 1], [60 * 1024 * 1024, 41 * 1024 * 1024]]) {
+  for (const sizes of [[MAX_ARTIFACT_BYTES + 1], [60 * 1024 * 1024, 41 * 1024 * 1024]]) {
     const result = await artifactTurn({ response: async (body) => {
       const directory = artifactPath(body.system);
       const names = [];

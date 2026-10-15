@@ -638,7 +638,7 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
   await waitFor(() => posts.length === 1);
   await handlers.subscribed(thread, { id: "2", text: "<@U2> follow up", author: human, raw: {} });
   await waitFor(() => posts.length === 2);
-  const attachment = { name: "notes.txt", size: 100 * 1024 * 1024, fetchData: async () => Buffer.from("notes") };
+  const attachment = { name: "notes.txt", size: 10 * 1024 * 1024, fetchData: async () => Buffer.from("notes") };
   await handlers.mention(thread, { id: "file-1", text: "@U1 summarize", attachments: [attachment], author: human, raw: {} });
   await waitFor(() => posts.length === 3);
   await handlers.subscribed(thread, { id: "file-2", text: "compare this", attachments: [attachment], author: human, raw: { subtype: "file_share" } });
@@ -657,8 +657,8 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
   }
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(calls.length, beforeIgnored);
-  await handlers.mention(thread, { id: "too-large", text: "@U1 summarize", attachments: [{ ...attachment, size: 100 * 1024 * 1024 + 1 }], author: human, raw: {} });
-  await waitFor(() => posts.includes("Pipa can read files up to 100 MB each."));
+  await handlers.mention(thread, { id: "too-large", text: "@U1 summarize", attachments: [{ ...attachment, size: 10 * 1024 * 1024 + 1 }], author: human, raw: {} });
+  await waitFor(() => posts.includes("Pipa can read files up to 10 MiB each."));
   assert.equal(calls.length, beforeIgnored);
   await handlers.subscribed(thread, { id: "missing-size", text: "no declared size", attachments: [{ ...attachment, size: undefined }], author: human, raw: { subtype: "file_share" } });
   await waitFor(() => calls.length === beforeIgnored + 1);
@@ -677,7 +677,7 @@ test("Slack composition subscribes mentions, restores sessions, and ignores unsu
     { markdown: "<@U2> follow up:ses_1" },
   ]);
   assert.deepEqual(posts.slice(2, 4), [{ markdown: "summarize:ses_1" }, { markdown: "compare this:ses_1" }]);
-  assert.equal(posts[4], "Pipa can read files up to 100 MB each.");
+  assert.equal(posts[4], "Pipa can read files up to 10 MiB each.");
   assert.deepEqual(posts[5], { markdown: "no declared size:ses_1" });
   assert.equal(posts[6], "Piper failed: Could not read one of the attached files. Please try uploading it again.");
   assert.deepEqual(posts.slice(7, 10).map((part) => part.markdown.length), [3500, 3500, 1]);

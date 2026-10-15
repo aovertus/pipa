@@ -69,8 +69,11 @@ export async function startPipa(options = {}) {
       artifactRoot: path.join(config.workingDirectory, ".pipa", "artifacts"),
       baseUrl: server.baseUrl,
       connection: server.connection,
+      recoveryFile: paths.openCodeRecovery,
       onFatal: server.fail,
     });
+    await executor.ready?.(config.workingDirectory);
+    options.signal?.throwIfAborted();
   } catch (error) {
     server?.stop();
     await withTimeout(server?.wait(), options.shutdownTimeoutMs ?? 15_000, "OpenCode shutdown timed out.").catch(() => undefined);
@@ -183,7 +186,7 @@ export async function startPipa(options = {}) {
     const attachments = message.attachments ?? [];
     if (subscribe) await thread.subscribe();
     if (attachments.some(({ size }) => size !== undefined && (!Number.isSafeInteger(size) || size < 0 || size > MAX_ATTACHMENT_BYTES))) {
-      await thread.post("Pipa can read files up to 100 MB each.");
+      await thread.post("Pipa can read files up to 10 MiB each.");
       return;
     }
     if (!accepting) return;
