@@ -20,6 +20,7 @@ Pipa is a Node.js command-line application with Socket and Managed profile modes
 GitHub-specific automation.
 
 - `.github/workflows/ci.yml`: Runs continuous integration for every pull request and every push to `main`. GitHub creates one job each for Ubuntu, macOS, and Windows. Each job checks out the repository, installs Node.js 22, installs the exact dependencies from `package-lock.json`, runs the unit and integration tests, then packs and smoke-tests the installable CLI. The operating-system matrix catches platform-specific problems before release.
+- `.github/workflows/opencode-compatibility.yml`: No-secret pinned native-engine matrix, separate from default tests. Live Slack/client and operator gates remain external qualification evidence.
 - `.github/workflows/stats.yml`: Runs daily and on manual dispatch to validate and update the committed npm-download statistics. It uses only `contents: write`, serializes runs, and commits `STATS.md` only when the generated file changed.
 
 ### `bin/`
@@ -33,6 +34,8 @@ The public command-line entry point installed by npm.
 Long-form repository documentation.
 
 - `docs/repository-overview.md`: This file. It explains the repository structure and how the application works.
+- `docs/opencode-compatibility.md`: Version/capability policy, existing-profile upgrade, deliberate v2 migration, matched-snapshot rollback and private operator checklist.
+- `docs/pipa-testing.md`: Deterministic/native/live lanes, isolated profiles, live evaluator inputs, evidence and cleanup.
 
 ### `scripts/`
 
@@ -40,6 +43,10 @@ Repository maintenance and release checks that are not part of the installed run
 
 - `scripts/pack-smoke.mjs`: Tests the package users will actually receive. It packs and installs the archive in a temporary directory, verifies version, routine help and side-effect-free preview, Local initialization, and cancellation, then starts a Managed profile with a fake OpenCode executable that checks arguments, working directory, and inherited environment without Slack credentials. It removes the temporary artifact when finished.
 - `scripts/stats.mjs`: Fetches validated npm download data for `@usepipa/pipa` and appends one completed UTC-day snapshot to `STATS.md`. It fails without changing existing statistics when the source data or prior file is unsafe.
+- `scripts/test-opencode-matrix.mjs`: Installs an integrity-checked candidate and exact native pins privately, runs shared semantic cases and optional migration/rollback, and records honest deterministic/release gates.
+- `scripts/slack-release-eval.mjs`: Opt-in serial live collector reusing the semantic catalog and routine flow; new/existing thread continuation, both routine destinations, optional independently observed restart and explicit blocked human/integration gates.
+- `scripts/slack-routine-eval.mjs`: Import-inert reusable preview/confirmation/scheduled-result flow; validates exact saved input, lifecycle, session continuation, duplicate observation and nonce-only cleanup.
+- `scripts/verification/slack-eval.mjs`: Shared authenticated preflight, paginated/rate-limited Slack reads, credential-clean CLI calls, app-scoped local lock and durable restart observation. Candidate process ownership stays with the operator.
 
 ### `src/`
 

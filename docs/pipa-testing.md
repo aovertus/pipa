@@ -1,6 +1,6 @@
 # Pipa testing strategy
 
-This is the reusable testing procedure for runtime changes, including one Pipa release with v1/v2 HTTP adapters. The implementation plan's Verification Contract owns the detailed feature matrix and release gates. New harness files and commands below are planned deliverables, not capabilities already implemented.
+This is the reusable testing procedure for the dual-adapter candidate. The implementation plan's Verification Contract owns the detailed feature matrix and release gates. Harness delivery and targeted native passes do not establish release qualification. See [compatibility and operator transition](opencode-compatibility.md) and the [U7 evidence](research/opencode-u7-verification.md).
 
 ## Three kinds of proof
 
@@ -16,7 +16,7 @@ Both adapters must pass the same semantic scenarios: exact prompts, session cont
 
 Build the fixture contract and real-engine runner before the port. Record the current v1 baseline and current v2 failures rather than emulating a missing adapter. The harness-delivery step can finish with those named baseline incompatibilities; release qualification cannot. Rerun the identical production-path cases as the adapters and live evaluator land.
 
-Planned harness ownership:
+Harness ownership:
 
 | Surface | Responsibility |
 |---|---|
@@ -25,9 +25,9 @@ Planned harness ownership:
 | `test/opencode-contract.test.mjs` | Both fixture generations in default `npm test` |
 | `scripts/test-opencode-matrix.mjs` | Pinned real engines and installed Pipa tarball, with a deterministic local model |
 | `scripts/verification/opencode-release-cases.mjs` | Shared production-path real-engine scenarios, outside default test discovery |
-| `scripts/slack-release-eval.mjs` | Serial real Slack/provider cases, routine evaluator reuse, independent restart observation, evidence |
+| `scripts/slack-release-eval.mjs` | Serial opt-in Slack/provider collection, shared live checklist, routine evaluator reuse, optional independent restart observation; human/integration gates remain blocked |
 
-Keep the default `npm test`/`npm run test:pack` lane free of downloaded engines and live credentials. The planned `test:engines` lane qualifies pins **1.18.35, 1.19.0, and 2.0.29** against Socket-owned, Managed, and attached modes on Linux/macOS/Windows where supported. Node 22 is the baseline. The downloaded executable's identity and package integrity must match the selected cell; no global executable is replaced.
+Keep the default `npm test`/`npm run test:pack` lane free of downloaded engines and live credentials. The opt-in `test:engines` lane exercises pins **1.18.35, 1.19.0, and 2.0.29** against Socket-owned, Managed, and attached modes on Linux/macOS/Windows where supported. Node 22 is the baseline. The downloaded executable's identity and package integrity must match the selected cell; no global executable is replaced. Use `--migration` for synthetic upgrade/rollback. See [runner options](../scripts/verification/README.md).
 
 The Socket-owned engine cell composes the real Pipa application, executor, scheduler and state with injected fake Chat/auth. Managed cells use the actual installed CLI and detached restart chain. Attached cells use an independently launched server and prove ownership preservation. Real Socket CLI restart and visible Slack controls still require the live lane; fake Chat does not prove them.
 
@@ -58,15 +58,15 @@ Use a separate Slack test app and channel when available. Reusing an existing ap
 
 Copy the committed `.env.example` to the gitignored `.env.test` and fill in the environment values for your workspace. Alternatively, inject the same environment variables from your shell or CI secret store. Do not add a second credentials-file format or a dotenv dependency.
 
-Run the existing routine evaluator with Node 22's native environment-file support:
+The live entry point defaults to a side-effect-free checklist:
 
 ```sh
-node --env-file=.env.test scripts/slack-routine-eval.mjs
+npm run test:slack:release -- --plan
 ```
 
-This command requires the candidate Socket profile to be configured and running first. `PIPA_HOME` selects that private profile; its saved config contains the Slack app/bot credentials. OpenCode's database/config isolation uses the qualified release's supported path overrides separately. `.env.example` contains names and blank values only; never commit populated env files or credentials. The broader v2 evaluator will use the same input convention.
+For real execution, configure and start an isolated candidate first. `PIPA_HOME` selects its profile; its saved config contains the app/bot credentials. Restrict `allowedSlackChannelIds` to exactly the test channel. Isolate OpenCode HOME/XDG/Windows app-data/DB/config separately. Configure the intended real provider/model there; the evaluator does not change model preferences or automatically install/start a candidate.
 
-Existing `scripts/slack-routine-eval.mjs` uses:
+Both evaluators use:
 
 | Input | Purpose |
 |---|---|
@@ -74,10 +74,50 @@ Existing `scripts/slack-routine-eval.mjs` uses:
 | `SLACK_PIPA_BOT_USER_ID` | Identifies candidate Pipa replies |
 | `SLACK_USER_TOKEN` | Existing human-message evaluation path |
 | `PIPA_HOME` | Selects the candidate's private profile |
+| `PIPA_TEST_SOLE_CONSUMER` | Set to `confirmed` only after stopping all other consumers of the selected app, including other hosts |
+| `PIPA_TEST_ENGINE_URL`, `PIPA_TEST_ENGINE_PIN` | Exact serving URL and native version; authenticated identity/migration/workspace readiness are checked read-only |
+| `PIPA_TEST_CLI` | Optional absolute installed candidate `bin/pipa.mjs`; defaults to the checkout CLI |
+| `SLACK_SENDER_BOT_TOKEN` | Optional separate sender; actual posted `bot_id` must be allowed. Human token still reads channel history/replies |
 
-The routine evaluator currently assumes a running Socket profile and tests preview, explicit confirmation, scheduled nonce delivery, duplicate detection, and test-routine cleanup. It does not currently cover the full migration feature matrix.
+`SLACK_USER_TOKEN` needs access to the selected public/private channel and the history/replies API, plus `chat:write` when used as sender. Candidate bot identity and reader/sender workspace identities must agree. The sender must pass the profile's authorization; Pipa cannot be its own test sender. Keep tokens out of command arguments, logs and child environments.
 
-The compatibility plan adds the pinned matrix and a broader Slack evaluator. Reuse the existing routine flow rather than duplicating scheduler logic. Planned bot-sender support can use a token from another existing app; it must use that app's actual message `bot_id`, allowed only in the candidate profile. Pipa ignores its own messages, so it cannot act as its own test sender.
+With explicit operator authorization to post test messages and create nonce routines:
+
+```sh
+node --env-file=.env.test scripts/slack-release-eval.mjs --run --mode=socket-owned
+# Or only the narrower channel-destination routine smoke:
+node --env-file=.env.test scripts/slack-routine-eval.mjs
+```
+
+Use `--mode=attached` with the candidate's matching `PIPA_OPENCODE_ATTACH_URL` for an attached profile. The configured engine URL is the current actual server URL; an owned replacement can bind a new port. A separately hosted attached server still needs independent deployment/ownership evidence.
+
+The collector runs new-thread/history recall and both channel/existing-thread one-time routines serially. The shared routine flow checks preview did not mutate saved state, explicit confirmation, exact prompt, UTC/normalized one-minute schedule, route, successful scheduled lifecycle, result-session continuation, and one result after a further 35-second scheduler boundary. It deletes only newly created nonce routines and verifies their absence. It retains Slack messages for evidence and leaves the operator-owned candidate running.
+
+Restart is separately opt-in and must be run by an observer outside the candidate's agent/process tree, on the Pipa host:
+
+```sh
+node --env-file=.env.test scripts/slack-release-eval.mjs --run --mode=socket-owned --restart
+```
+
+This posts a real restart request to the test thread. The observer checks the old generation's durable outcome, old PID exit, matching live replacement PID/generation, one exact bot-name ready notice, replacement survival, and original-session marker recall. It does not accept request acknowledgement as completion. Attached-engine PID survival, worker-exit diagnostics and post-restart scheduler recovery additionally require the native/operator checks; this collector does not certify those from a Slack reply.
+
+Each evaluator takes a local app-scoped lock in the OS temp directory, shared across profile homes. It refuses a competing evaluator and never cancels one. If a killed evaluator leaves that lock, verify the evaluator/candidate and nonce routines before removing the stale lock manually. This lock cannot detect Socket consumers on other hosts: sole-consumer confirmation remains an operator requirement. Protected CI must also use app-scoped concurrency with `cancel-in-progress: false`.
+
+Failed observations retain that lock: deleting currently visible nonce routines
+does not prove an outstanding agent cannot create one later. Stop/drain the
+candidate, reconcile every routine containing the report's nonce, verify cleanup,
+then remove the retained lock. Do not launch another evaluator while this is unresolved.
+
+Private JSON reports go under gitignored `tmp/slack-release-evals/` or `tmp/slack-routine-evals/`, mode 0600. The release collector intentionally exits nonzero with BLOCKED while human/integration gates remain unobserved, even if automated subcases pass. It records shared live case IDs, does not turn a nonce reply into `live-slack-provider` approval/file coverage, and never declares the whole release qualified. Complete the compatibility guide's private checklist and combine with required native/platform evidence. The routine-only smoke exits zero only when its own assertions and cleanup pass.
+
+The supplied CLI and engine URL are independent probes, not proof of what the
+running Socket process loaded. Reports retain the observed CLI/endpoint versions
+under `identityBinding`, leave candidate package/engine/adapter unset, and mark
+mode unverified. Bind the lock's PID/generation to the actual launch package,
+serving endpoint and owned/attached mode in private operator evidence before
+attributing automated observations to an engine cell. Repeat that binding for a
+replacement. A passing probe against an unrelated v2 server cannot qualify v2
+Slack behavior.
 
 A sender bot cannot stand in for an authorized human clicking a button or submitting a modal. Use human-assisted real interaction checks where necessary and deterministic handler tests for repeatable authorization/error coverage. Mark which checks are automated and which require a responder.
 
@@ -105,7 +145,7 @@ For each scenario, record `PASS`, `FAIL`, or `BLOCKED`, versions/platform, expec
 
 Evidence also names the adapter selected, connection mode, package version, automated versus human-assisted coverage, and documented native `NOT_APPLICABLE` cases. Common behavior cannot be marked not applicable. Live model switching is v2-specific; ordinary v1 questions, permissions and routines are not optional.
 
-Use a unique run nonce. Clean up only that run's test routines, files, and owned processes. Leave unrelated channel history and saved routines alone. Keep raw evidence private; share a sanitized summary. A failed cleanup makes the run fail. Missing credentials, a human responder, integration access, or platform evidence makes that coverage blocked.
+Use a unique run nonce. Clean up only that run's test routines, files, and owned processes. Leave unrelated channel history and saved routines alone. Keep raw evidence private; share a sanitized summary. A failed cleanup makes the run fail. Missing credentials, a human responder, integration access, or platform evidence makes that coverage blocked. After collection, the operator stops the candidate, verifies process/port/lock/staging cleanup and attached-server survival, and records that separate cleanup result before relinquishing the app.
 
 Track and close all provider/stream listeners, process trees, ports, locks, staging/artifact paths and nonce-owned routines, including failure paths. Assert an attached engine survives Pipa stop before harness-owned teardown. Keep the test root only for explicitly retained sanitized diagnostics. A local loopback server/data-URI fixture is not proof of a remote filesystem or host; separately hosted deployment coverage remains an explicit gate.
 

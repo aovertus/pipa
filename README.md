@@ -20,10 +20,12 @@ Profiles created by `pipa init` use Socket Mode. Profiles written before mode su
 ### Requirements
 
 - Node.js 22 or newer
-- [OpenCode](https://opencode.ai) installed and authenticated
+- [OpenCode](https://opencode.ai) installed and authenticated; the dual-adapter candidate selects native v1/v2 automatically (qualification pins: 1.18.35, 1.19.0, 2.0.29; release-qualified minimums pending)
 - A Slack workspace where you can create an app
 
 Invite the Slack app only to channels whose members may use OpenCode in the configured working directory.
+
+See [OpenCode compatibility](docs/opencode-compatibility.md) for remaining-on-v1 and deliberate-v2 upgrade paths, matched-snapshot rollback, capability differences and remaining release gates. Upgrading Pipa preserves the existing Slack profile; it does not require recreating the Slack app or upgrading OpenCode.
 
 ### Install
 
@@ -196,7 +198,7 @@ npm test
 npm run test:pack
 ```
 
-`npm run test:slack:routines` is a manual real-service smoke test. It requires a running local Socket Mode process plus `SLACK_USER_TOKEN`, `SLACK_TEST_CHANNEL_ID`, and `SLACK_PIPA_BOT_USER_ID`; it is not part of automatic CI.
+`npm run test:slack:routines` is a manual real-service smoke test. `npm run test:slack:release -- --plan` lists the shared live gates without contacting Slack. The opt-in `--run` collector requires an isolated running Socket candidate and private inputs from `.env.example`; see the testing guide. Human/client and integration evidence remain separate mandatory gates.
 
 See the [testing strategy](docs/pipa-testing.md) for repeatable real-runtime and Slack validation, existing-app reuse, evidence, and cleanup.
 

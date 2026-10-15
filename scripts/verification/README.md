@@ -44,10 +44,21 @@ sanitized evidence and cleanup. Keep reports private: they contain disposable
 local paths and process identities. Never commit profile data or populated env
 files.
 
-## Current baseline
+## Live collection and current evidence
 
-The pre-port package is expected to fail compatibility checks. See
+`npm run test:slack:release -- --plan` lists the same catalog's applicable live
+gates without network calls. Real collection is explicitly `--run`; it reuses
+the strengthened routine evaluator and can independently observe a separately
+authorized `--restart`. It never promotes partial API smoke into human/client,
+operator-plugin, remote-host or whole-release qualification. See
+[`docs/pipa-testing.md`](../../docs/pipa-testing.md) for private inputs and cleanup,
+and [`docs/opencode-compatibility.md`](../../docs/opencode-compatibility.md) for
+upgrade/rollback and operator checks.
+
+The historical pre-port package failed compatibility checks. See
 [`docs/research/opencode-harness-baseline.md`](../../docs/research/opencode-harness-baseline.md)
 for observed results and remaining qualification gaps. Rerun the same cases as
 runtime selection and adapters land; do not weaken assertions to obtain green
-output.
+output. Later unit reports, including
+[`U7`](../../docs/research/opencode-u7-verification.md), supersede historical
+baseline observations only where their actual recorded cases cover the behavior.
