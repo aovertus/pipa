@@ -75,7 +75,10 @@ export async function startPipa(options = {}) {
     await withTimeout(server?.wait(), options.shutdownTimeoutMs ?? 15_000, "OpenCode shutdown timed out.").catch(() => undefined);
     throw error;
   }
-  const runner = createConversationRunner({ sessionStore, runTurn: executor.runTurn, abortTurn: executor.abortTurn });
+  const runner = createConversationRunner({ sessionStore, abortTurn: executor.abortTurn, runTurn: async (input) => {
+    const currentConfig = await loadCurrentConfig();
+    return executor.runTurn({ ...input, ...(currentConfig.defaultModel ? { model: currentConfig.defaultModel } : {}) });
+  } });
   let accepting = true;
   const interactions = createPendingInteractions(config.allowedSlackUserIds);
   const pendingReactions = new Map();
@@ -195,11 +198,9 @@ export async function startPipa(options = {}) {
     pending.push({ thread, message });
     pendingReactions.set(thread.id, pending);
     try {
-      const currentConfig = await loadCurrentConfig();
       const interactionContext = { thread };
       const result = await runner.enqueue(thread.id, {
         prompt,
-        ...(currentConfig.defaultModel ? { model: currentConfig.defaultModel } : {}),
         attachments,
         workingDirectory: config.workingDirectory,
         contextEnvironment: slackContext(thread, message),

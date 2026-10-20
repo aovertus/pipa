@@ -221,6 +221,21 @@ test("create, list, show, edit, run, and delete preserve lifecycle fields", asyn
   assert.deepEqual(json(run(home, "list", "--json")).routines, []);
 });
 
+test("routine creation snapshots A or unset and edits never adopt live B", async () => {
+  const { home, paths } = await setup();
+  const config = JSON.parse(await readFile(paths.config, "utf8"));
+  const create = () => json(run(home, "create", "--prompt", "daily", "--timezone", "UTC", "--channel", "C123", "--every", "30m", "--json")).routine;
+  const unset = create();
+  assert.equal(unset.model, null);
+  const a = { providerID: "openai", modelID: "a" };
+  await writePrivateJson(paths.config, { ...config, defaultModel: a });
+  const selected = create();
+  assert.deepEqual(selected.model, a);
+  await writePrivateJson(paths.config, { ...config, defaultModel: { providerID: "fireworks-ai", modelID: "b" } });
+  assert.deepEqual(json(run(home, "edit", selected.id, "--prompt", "changed", "--json")).routine.model, a);
+  assert.equal(json(run(home, "edit", unset.id, "--prompt", "changed", "--json")).routine.model, null);
+});
+
 test("reactivating a stale one-time routine requires a new future schedule", async () => {
   const { home } = await setup();
   const created = json(run(home, "create", "--prompt", "once", "--timezone", "UTC", "--channel", "C123", "--at", "2030-01-01T00:00:00Z", "--json")).routine;

@@ -13,6 +13,34 @@ import { createSessionStore, pipaPaths, writePrivateJson } from "../src/state.mj
 
 const startPipa = (options) => startPipaRuntime({ routinesEnabled: false, ...(options.config && !options.paths ? { loadCurrentConfig: async () => options.config } : {}), ...options });
 
+test("a delayed model read cannot let an older message supersede a newer one", async () => {
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const handlers = {};
+  const posts = [];
+  const calls = [];
+  let reads = 0;
+  const config = { botName: "Pipa", workingDirectory: "/work", slackBotToken: "xoxb-test", slackAppToken: "xapp-test" };
+  const app = await startPipa({ config, loadCurrentConfig: async () => {
+    if (++reads === 1) { entered.resolve(); await release.promise; }
+    return config;
+  }, checkSlackToken: async () => ({ ok: true }),
+  sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
+  executor: { runTurn: async (input) => { calls.push(input.prompt); return { text: input.prompt, sessionId: "same" }; }, stopAll() {} },
+  chat: { onNewMention: (fn) => { handlers.mention = fn; }, onSubscribedMessage: (fn) => { handlers.reply = fn; }, initialize: async () => undefined, shutdown: async () => undefined } });
+  const thread = { id: "slack:C1:1.0", channel: { isDM: false }, subscribe: async () => undefined,
+    adapter: { addReaction: async () => undefined, removeReaction: async () => undefined }, post: async (text) => posts.push(text) };
+  const message = (id, text) => ({ id, text, author: { userId: "U1" }, raw: {} });
+  await handlers.mention(thread, message("1.0", "older"));
+  await entered.promise;
+  await handlers.reply(thread, message("2.0", "newer"));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  release.resolve();
+  await waitFor(() => calls.length === 2);
+  await app.shutdown();
+  assert.deepEqual(posts.at(-1), { markdown: "newer" });
+});
+
 test("init validates dependencies before replacing config", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "pipa-init-"));
   const paths = pipaPaths(home);
