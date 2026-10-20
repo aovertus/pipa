@@ -6,7 +6,7 @@ Date: 2026-10-20. Harness/model: OpenCode / `openai/gpt-6.1-sol`.
 
 Implemented installation-wide model persistence, ordinary request selection, routine snapshots, native Slack picker, manifest command/scope, and setup documentation.
 The initial checkout collision was resolved with the user's authorization: unrelated no-reply work is preserved in stash `deferred no-reply changes before STU-722`. The stash and pre-existing `tmp/` evaluation data remain untouched.
-Production Pipa and Slack were not modified or restarted.
+The production Pipa process, production Slack app settings, and production config were not modified or restarted. A distinct temporary Slack app/profile was created for live smoke, then removed after verification.
 
 ## Plan and review
 
@@ -52,10 +52,22 @@ Exact successful commands (exit 0):
 
 The native routing test replaces only outbound Slack calls. It does not start a Socket listener, create Slack messages, or use real Slack credentials. It proves SDK callback and request-boundary behavior, not live provider completion.
 
-## Live smoke limitation
+## Live smoke evidence
 
-No distinct isolated Slack app/profile with app and bot tokens, installed `/pipa`, `commands`, and an authorized channel/user was supplied for this run. No second listener was started with production credentials.
-Consequently live modal behavior, completed provider/model metadata for A/B, real retained conversation history, and persistence after a test-profile restart remain unverified. Historical provider preflight and HTTP acceptance are not substituted for that evidence. Follow `CONTRIBUTING.md`'s isolated smoke procedure to close the gap.
+The initial absence of an isolated profile was resolved using the already authenticated app-management browser. The generated manifest was accepted by Slack to create **Pipa Model Test 722**, app `A0CA6RMHH7H`, with its own app/bot tokens, `/pipa`, `commands`, and Socket Mode. The test bot was invited to the allowed `#test-prod-pipa` channel. Only this distinct profile's Socket listener was started; it attached to the existing OpenCode server with a separate temporary workspace and never owned or restarted that server.
+
+[Existing test conversation](https://lunchpaillabs.slack.com/archives/C0BNJJ9RDB2/p1792500540431779)
+
+| Step | Requested and completed model metadata | Result |
+|---|---|---|
+| A | `fireworks-ai` / `accounts/fireworks/routers/deepseek-flash-latest` | Native search and Save succeeded; reopen showed saved A; session storage remained empty until the ordinary prompt. Completed response was `MODEL_A_READY`. |
+| B | `openai` / `gpt-6.1-sol` | Native search and Save succeeded. A same-thread human followup completed with B and recalled `COBALT-722` from the A prompt, proving retained history. |
+| Cancel | B remained selected | Selecting A then canceling and confirming Leave did not alter saved B. |
+| Test-only restart | B remained selected | Stopped the test-owned listener, started a replacement with the same isolated profile, and reopened the native modal showing `openai / gpt-6.1-sol`. |
+
+Both completed messages used session `ses_ea6a45909ffekUyM643keCH9oT`. Assistant IDs: A `msg_1595ba732001xmk5SD8QZQASqZ`, B `msg_1595e40cc001fxPQxxVQa7t2ap`. The second verification observed two user messages in that same session. These are captured response metadata, not model self-identification or HTTP acceptance. Fireworks router metadata does not prove its internal upstream model identity.
+
+Cleanup stopped only test-owned PIDs, deleted the temporary Slack app (invalidating its tokens), removed the test-owned OpenCode session and local profile/credentials, and retained non-secret evidence. The Slack test conversation remains as evidence. Recorded session/message IDs are historical after cleanup.
 
 ## Shipping follow-through
 
@@ -65,9 +77,9 @@ Code review found one P1 ordering regression at the new pre-enqueue config read.
 
 Review coverage: correctness, scoped project standards, testing, security, reliability, adversarial, API contract, and agent-native passes ran inline. No independent agreement promotion was used. A separate validator was unavailable; the P1 was retained validation-degraded during review and then proved by the red/green regression. No actionable findings or settled-decision conflicts remain.
 
-Browser test result: **PARTIAL**. No local web routes or browser dev server exist in this CLI. The native Slack picker live flow is **Skip** because it requires the distinct test installation described above. No production listener or browser session was started. Native SDK/adapter automated evidence is separate from this skip.
+Browser/native smoke result: **PASS** for open/search/Save/reopen/Cancel and test-only restart persistence, using the existing authenticated browser and the distinct test app. Completed A/B execution metadata and retained history were verified separately through the OpenCode API. This CLI has no local web routes or browser dev server.
 
-Shipping and CI outcomes are recorded after the PR exists.
+PR: https://github.com/lunchpaillola/pipa/pull/41 . The pipeline snapshot for head `ee6a771` reported all checks terminal/successful, `MERGEABLE`, `CLEAN`, current-base identity proven, zero actionable feedback, and no branch-currency or human-decision blocker. The final live-evidence documentation update is checked again on its new head; the babysitter's final return and PR run-report comment record that outcome without another CI-triggering report edit.
 
 ### Implementation receipt
 
@@ -85,7 +97,7 @@ Shipping and CI outcomes are recorded after the PR exists.
     {"unit": "U1", "behavior_changed": true, "existing_tests_inspected": ["test/state.test.mjs", "test/opencode.test.mjs"], "tests_added_or_changed": ["test/state.test.mjs", "test/opencode.test.mjs"], "tests_used_unchanged": "Other state/executor cases", "red_observed": "Missing setting export and absent native payload model", "result": "Owning suites exit 0"},
     {"unit": "U2", "behavior_changed": true, "existing_tests_inspected": ["test/app.test.mjs", "test/routines.test.mjs", "test/cli.test.mjs"], "tests_added_or_changed": ["test/app.test.mjs", "test/routines.test.mjs", "test/cli.test.mjs"], "tests_used_unchanged": "Other app/routine/CLI cases", "red_observed": "Absent dispatch snapshot, preview inheritance, null retention", "result": "Owning suites exit 0"},
     {"unit": "U3", "behavior_changed": true, "existing_tests_inspected": ["test/app.test.mjs", "test/state.test.mjs", "test/opencode.test.mjs"], "tests_added_or_changed": ["test/models.test.mjs", "test/state.test.mjs", "test/opencode.test.mjs"], "tests_used_unchanged": "Existing permission/question/shutdown cases", "red_observed": "Picker module absent before implementation", "result": "Native adapter, failure matrix, authenticated catalog, timeout suites exit 0"},
-    {"unit": "U4", "behavior_changed": false, "existing_tests_inspected": ["scripts/pack-smoke.mjs"], "tests_added_or_changed": ["scripts/pack-smoke.mjs"], "tests_used_unchanged": "Installed initialization and Managed smoke", "result": "Full suite and pack smoke exit 0", "exception_reason": "Live smoke unavailable without distinct Slack test installation; docs reviewed against implementation"}
+    {"unit": "U4", "behavior_changed": false, "existing_tests_inspected": ["scripts/pack-smoke.mjs"], "tests_added_or_changed": ["scripts/pack-smoke.mjs"], "tests_used_unchanged": "Installed initialization and Managed smoke", "result": "Full suite and pack smoke exit 0; isolated live native picker, completed A/B metadata, same-session history, Cancel, and test-only restart passed", "exception_reason": "No local web routes; native Slack UI used instead"}
   ],
   "implementation_engine_binding": null,
   "requested_route": "native",
@@ -98,7 +110,7 @@ Shipping and CI outcomes are recorded after the PR exists.
     {"unit": "U1", "route": "native", "model": "openai/gpt-6.1-sol", "detached_process": null, "integration": "canonical checkout", "verification": "passed", "commit": "8679b5f", "cleanup": "no worker"},
     {"unit": "U2", "route": "native", "model": "openai/gpt-6.1-sol", "detached_process": null, "integration": "canonical checkout", "verification": "passed", "commit": "4cbc321", "cleanup": "no worker"},
     {"unit": "U3", "route": "native", "model": "openai/gpt-6.1-sol", "detached_process": null, "integration": "canonical checkout", "verification": "passed", "commit": "467231a", "cleanup": "no worker"},
-    {"unit": "U4", "route": "native", "model": "openai/gpt-6.1-sol", "detached_process": null, "integration": "canonical checkout", "verification": "passed; live gap disclosed", "commit": "fd8181c", "cleanup": "no worker"}
+    {"unit": "U4", "route": "native", "model": "openai/gpt-6.1-sol", "detached_process": "isolated test listener only; stopped", "integration": "canonical checkout", "verification": "automated/package/live passed", "commit": "fd8181c plus final evidence update", "cleanup": "temporary app, session, profile and credentials removed"}
   ],
   "plan_checkpoint": null,
   "blockers": [],
