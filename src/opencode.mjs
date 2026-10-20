@@ -4,6 +4,7 @@ import { chmod, lstat, mkdir, mkdtemp, open, realpath, rm, writeFile } from "nod
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { normalizeModel } from "./state.mjs";
 
 const SLACK_SECRET_ENV_KEY = /(?:^|_)SLACK(?:_[A-Z0-9]+)*_(?:TOKEN|SECRET)$/iu;
 const LISTENING_URL = /https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+/u;
@@ -127,7 +128,7 @@ export function createOpenCodeExecutor(options = {}) {
   async function runTurn({ prompt, sessionId, model, workingDirectory, contextEnvironment = {}, attachments = [], signal, onSession, onInteraction, onPermissionReplied, onPermissionsReconciled }) {
     if (!prompt?.trim()) throw new Error("A prompt is required.");
     if (stopReason) throw stopReason;
-    const selectedModel = model == null ? null : { providerID: model.providerID, modelID: model.modelID };
+    const selectedModel = normalizeModel(model);
     const temporaryDirectory = attachments.length ? await mkdtemp(path.join(os.tmpdir(), "pipa-files-")) : null;
     const slackTurn = contextEnvironment.PIPA_MESSAGE_CHANNEL === "slack";
     const controller = new AbortController();
@@ -255,6 +256,26 @@ export function createOpenCodeExecutor(options = {}) {
 
   return {
     runTurn,
+    async listModels(workingDirectory) {
+      if (stopReason) throw stopReason;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(new Error("Model discovery timed out.")), 1_500);
+      active.add(controller);
+      try {
+        const catalog = await request("/config/providers", { method: "GET" }, workingDirectory, controller, [200], false);
+        if (!Array.isArray(catalog?.providers)) throw new Error("OpenCode returned an invalid model catalog.");
+        return catalog.providers.flatMap((provider) => {
+          if (!provider?.models || typeof provider.models !== "object" || Array.isArray(provider.models)) throw new Error("Invalid provider models.");
+          return Object.entries(provider.models).map(([id, model]) => ({
+            ...normalizeModel({ providerID: provider.id, modelID: model.id ?? id }),
+            name: typeof model.name === "string" ? model.name : id,
+          }));
+        });
+      } finally {
+        clearTimeout(timer);
+        active.delete(controller);
+      }
+    },
     async abortTurn(sessionId, reason = new Error("OpenCode turn aborted.")) {
       const turn = activeSessions.get(sessionId);
       if (!turn) return;

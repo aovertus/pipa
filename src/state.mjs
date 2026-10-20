@@ -12,6 +12,7 @@ const MANIFEST = {
     long_description: "Pippette connects Slack to the OpenCode installed on your computer. Send text requests from Slack and receive replies in threads for the local folder you choose. OpenCode runs locally, and your Slack credentials stay on your machine. Learn more at usepipa.com.",
   },
   features: {
+    slash_commands: [{ command: "/pipa", description: "Configure this Pipa installation", usage_hint: "model", should_escape: false }],
     bot_user: {
       display_name: "Pippette",
       always_online: true,
@@ -21,6 +22,7 @@ const MANIFEST = {
     scopes: {
       user: ["files:read", "files:write"],
       bot: [
+        "commands",
         "files:read",
         "app_mentions:read",
         "assistant:write",

@@ -233,14 +233,20 @@ test("rejects an all-whitespace prompt before creating a session", async () => {
 
 test("replaces a stale persisted session only after a successful turn", async () => {
   let prompted = false;
+  let body;
+  const model = { providerID: "openai", modelID: "model-a" };
   const fetch = async (url, init = {}) => {
     const pathname = new URL(url).pathname;
-    if (pathname === "/session/ses_stale/message") return jsonResponse({ error: "not found" }, 404);
+    if (pathname === "/session/ses_stale/message") {
+      model.modelID = "changed-after-start";
+      return jsonResponse({ error: "not found" }, 404);
+    }
     if (pathname === "/session" && init.method === "POST") return jsonResponse({ id: "ses_new" });
     if (pathname === "/session/ses_new/message") {
       return jsonResponse(prompted ? [{ info: { id: "new", role: "assistant", time: { completed: 1 } }, parts: [{ type: "text", text: "recovered" }] }] : []);
     }
     if (pathname === "/session/ses_new/prompt_async") {
+      body = JSON.parse(init.body);
       prompted = true;
       return new Response(null, { status: 204 });
     }
@@ -249,8 +255,25 @@ test("replaces a stale persisted session only after a successful turn", async ()
   };
 
   const result = await createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1 })
-    .runTurn({ prompt: "continue", sessionId: "ses_stale", workingDirectory: "/work" });
+    .runTurn({ prompt: "continue", model, sessionId: "ses_stale", workingDirectory: "/work" });
   assert.deepEqual(result, { text: "recovered", sessionId: "ses_new" });
+  assert.deepEqual(body.model, { providerID: "openai", modelID: "model-a" });
+});
+
+test("configured model discovery uses authenticated workspace HTTP without inference", async () => {
+  const calls = [];
+  const executor = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", environment: { OPENCODE_SERVER_USERNAME: "pipa", OPENCODE_SERVER_PASSWORD: "secret" },
+    fetch: async (url, init) => {
+      calls.push(String(url));
+      assert.equal(init.headers.authorization, `Basic ${Buffer.from("pipa:secret").toString("base64")}`);
+      return Response.json({ providers: [{ id: "openai", models: { a: { id: "a", name: "A", secret: "never returned" } } }], default: {} });
+    } });
+  assert.deepEqual(await executor.listModels("/workspace"), [{ providerID: "openai", modelID: "a", name: "A" }]);
+  assert.deepEqual(calls, ["http://localhost:5555/config/providers?directory=%2Fworkspace"]);
+  const broken = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch: async () => Response.json({ nope: true }) });
+  await assert.rejects(broken.listModels("/work"), /invalid model catalog/u);
+  const stalled = createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch: async (_url, { signal }) => new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true })) });
+  await assert.rejects(stalled.listModels("/work"), /timed out/u);
 });
 
 test("does not complete until both the session is idle and a new assistant message exists", async () => {

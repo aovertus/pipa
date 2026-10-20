@@ -39,6 +39,9 @@ test("manifest preserves approved capabilities and substitutes the bot name", ()
   assert.ok(manifest.oauth_config.scopes.bot.includes("channels:read"));
   assert.ok(manifest.oauth_config.scopes.bot.includes("assistant:write"));
   assert.ok(manifest.oauth_config.scopes.bot.includes("users:read"));
+  assert.ok(manifest.oauth_config.scopes.bot.includes("commands"));
+  assert.equal(manifest.features.slash_commands[0].command, "/pipa");
+  assert.equal(manifest.features.slash_commands[0].usage_hint, "model");
   assert.deepEqual(manifest.settings.event_subscriptions.bot_events, ["app_mention", "message.channels", "message.groups"]);
   assert.equal(manifest.settings.interactivity.is_enabled, true);
   assert.equal(manifest.settings.socket_mode_enabled, true);

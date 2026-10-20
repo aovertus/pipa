@@ -3,7 +3,8 @@ import path from "node:path";
 import { Chat, Modal, TextInput } from "chat";
 import { createSlackAdapter } from "@chat-adapter/slack";
 import { createMemoryState } from "@chat-adapter/state-memory";
-import { canonicalWorkingDirectory, createManifest, createSessionStore, loadConfig, pipaPaths, saveConfig } from "./state.mjs";
+import { canonicalWorkingDirectory, createManifest, createModelSetting, createSessionStore, loadConfig, pipaPaths, saveConfig } from "./state.mjs";
+import { createModelPicker } from "./models.mjs";
 import { createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, PipaRestartingError, PipaStoppedError, runOpenCodeVersion, startSocketOpenCodeServer } from "./opencode.mjs";
 import { assertRoutineDestinationAllowed, createRoutineScheduler, loadRoutineState } from "./routines.mjs";
 
@@ -162,6 +163,8 @@ export async function startPipa(options = {}) {
       return { status: "succeeded" };
     },
   }) : null;
+  const modelPicker = createModelPicker({ chat, loadConfig: loadCurrentConfig,
+    listModels: () => executor.listModels(config.workingDirectory), setting: createModelSetting(paths.config) });
   chat.onAction?.(interactions.onAction);
   chat.onModalSubmit?.("pipa_custom", interactions.onCustomAnswer);
 
@@ -225,6 +228,7 @@ export async function startPipa(options = {}) {
   const stop = (reason = new PipaStoppedError()) => {
     if (!accepting) return;
     accepting = false;
+    modelPicker.close();
     routineScheduler?.stop(reason);
     runner.close(reason);
     executor.stopAll(reason);
@@ -245,6 +249,7 @@ export async function startPipa(options = {}) {
     options.signal?.throwIfAborted();
   } catch (error) {
     options.signal?.removeEventListener("abort", cancelled);
+    modelPicker.close();
     routineScheduler?.stop(error);
     await routineScheduler?.drain();
     await withTimeout(interactions.close(), options.shutdownTimeoutMs ?? 15_000, "Interaction shutdown timed out.").catch(() => undefined);
