@@ -80,7 +80,7 @@ if (process.argv[2] === "--version") {
   if (config.botName !== "Pack Bot" || config.workingDirectory !== await realpath(workingDirectory)) throw new Error("Packed init wrote invalid config.");
   if (manifest.display_information.name !== "Pack Bot") throw new Error("Packed init wrote invalid manifest.");
   if (!["channels:read", "assistant:write", "commands"].every((scope) => manifest.oauth_config.scopes.bot.includes(scope))) throw new Error("Packed init wrote incomplete Slack bot scopes.");
-  if (manifest.features.slash_commands[0].command !== "/pipa") throw new Error("Packed manifest omitted /pipa.");
+  if (manifest.features.slash_commands[0].command !== "/pack-bot") throw new Error("Packed manifest omitted the bot-name command.");
   config.defaultModel = { providerID: "openai", modelID: "pack-model" };
   await writeFile(path.join(home, ".pipa", "config.json"), JSON.stringify(config));
 

@@ -39,7 +39,7 @@ npm install --global @usepipa/pipa
 pipa init
 ```
 
-`pipa init` guides you through creating and installing the Slack app and saving its local configuration. The generated manifest includes `channels:read`, `assistant:write`, and `commands`, plus the `/pipa` slash command. If an existing installation has not granted a recommended scope, `pipa init` and `pipa start` print reauthorization guidance but continue running.
+`pipa init` guides you through creating and installing the Slack app and saving its local configuration. The generated manifest includes `channels:read`, `assistant:write`, and `commands`, plus a slash command derived from your configured bot name (`Chopper` gets `/chopper`). If an existing installation has not granted a recommended scope, `pipa init` and `pipa start` print reauthorization guidance but continue running.
 
 3. Start Pipa:
 
@@ -112,15 +112,19 @@ pipa start
 
 ### Choosing a model
 
-Type `/pipa model` in an allowed Slack channel. A private native modal shows the saved selection, or **OpenCode default** when none is saved. Search configured model names or IDs, choose one, and Save. Cancel leaves the setting unchanged. The command uses the existing channel and human-user allowlists, checked again on search and Save.
+Type your installation's command followed by `model` in an allowed Slack channel: `/chopper model` for `Chopper`, `/pipwick model` for `Pipwick`, or `/pipa model` for `Pipa`. A private native modal shows the saved selection, or **OpenCode default** when none is saved. Search configured model names or IDs, choose one, and Save. Cancel leaves the setting unchanged. The command uses the existing channel and human-user allowlists, checked again on search and Save.
+
+The command comes from the `botName` saved by `pipa init`. Pipa decomposes accented Latin characters, removes combining marks, lowercases the name, replaces runs of spaces/punctuation/other non-ASCII characters with `-`, trims edge hyphens, and limits the part after `/` to 31 characters (trimming any resulting trailing hyphen). For example, `Workshop "Bot"` becomes `/workshop-bot` and `Café 🧪` becomes `/cafe`. Names that cannot produce any ASCII letter or digit are rejected. This uses a conservative lowercase-letter/digit/hyphen subset within Slack's 32-character limit including `/`.
+
+Choose distinct resulting commands for installations in the same workspace. Case, punctuation, or truncation can make different names normalize to the same command; names are not automatically disambiguated. Slack slash commands are not namespaced, and the most recently installed app wins a collision. Custom installations do not also register a universal `/pipa` alias.
 
 The selection is installation-wide and stored as optional `defaultModel: { "providerID": "openai", "modelID": "your-model-id" }` in the existing `.pipa/config.json`. It takes effect without restarting Pipa: subsequent ordinary requests use it, including replies in existing threads. Running requests retain their original selection and thread history stays in the same session. When unset, Pipa omits the override and OpenCode chooses its default. This setting does not select models for separate subagents or external clients.
 
 New routines snapshot the selection when created; preview JSON shows that snapshot. Existing routines and their saved model are unchanged by later saves or routine edits. A routine with no saved model uses OpenCode's default, never the current installation setting. Human replies to routine results use the current installation selection.
 
-Search reads only the configured OpenCode provider catalog. A listed model may still lack credentials or quota; saving never runs inference to check it. Provider errors are surfaced without silently switching to another model. Abandoned pickers expire after 30 minutes; reopen `/pipa model` to continue.
+Search reads only the configured OpenCode provider catalog. A listed model may still lack credentials or quota; saving never runs inference to check it. Provider errors are surfaced without silently switching to another model. Abandoned pickers expire after 30 minutes; reopen your installation's model command to continue.
 
-**Existing Slack apps:** add the manifest's `/pipa` slash-command definition and `commands` bot scope in Slack app settings, retain Socket Mode and interactivity, then reinstall or reauthorize the app. Generating a local manifest does not update the installed Slack app. A running older Pipa needs a normal upgrade before the command is available.
+**Existing Slack apps:** add or replace the slash-command definition with the command matching the configured `botName`, and grant the `commands` bot scope in Slack app settings. Retain Socket Mode and interactivity, then reinstall or reauthorize the app. Renaming the app/bot in Slack alone does not rename its registered command or update Pipa's config. After changing `botName` locally, update Slack's matching command registration and restart that installation to load its new handler. Generating a local manifest alone does not update the installed Slack app. A running older Pipa needs a normal upgrade before the command is available.
 
 ### Routines
 

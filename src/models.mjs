@@ -9,7 +9,7 @@ function modelOption(model) {
   });
 }
 
-export function createModelPicker({ chat, loadConfig, listModels, setting, now = Date.now }) {
+export function createModelPicker({ chat, command, loadConfig, listModels, setting, now = Date.now }) {
   const pending = new Map();
   let closed = false;
   const userId = (event) => event.user?.userId ?? event.user?.id;
@@ -18,15 +18,15 @@ export function createModelPicker({ chat, loadConfig, listModels, setting, now =
       || (entry.viewId && entry.viewId !== (event.viewId ?? event.raw?.view?.id))
       || (config.allowedSlackUserIds?.length && !config.allowedSlackUserIds.includes(entry.userId))
       || (config.allowedSlackChannelIds?.length && !config.allowedSlackChannelIds.includes(entry.channelId))) {
-      throw new Error("This picker is unavailable or you are not authorized. Reopen /pipa model.");
+      throw new Error(`This picker is unavailable or you are not authorized. Reopen ${command} model.`);
     }
   };
   const confirmation = (message) => ({ action: "update", modal: Modal({ callbackId: "pipa_model_notice", title: "Pipa model", submitLabel: "Done", children: [CardText(message)] }) });
 
-  chat.onSlashCommand?.("/pipa", async (event) => {
+  chat.onSlashCommand?.(command, async (event) => {
     const reply = (text) => event.channel.postEphemeral(event.user, text, { fallbackToDM: false });
     if (closed) return;
-    if (event.text.trim() !== "model") return reply("Use /pipa model to choose the default for this Pipa installation.");
+    if (event.text.trim() !== "model") return reply(`Use ${command} model to choose the default for this Pipa installation.`);
     let token;
     try {
       const config = await loadConfig();
@@ -48,7 +48,7 @@ export function createModelPicker({ chat, loadConfig, listModels, setting, now =
       entry.viewId = opened.viewId;
     } catch {
       pending.delete(token);
-      await reply("Could not open the model picker. Check your access and try /pipa model again.");
+      await reply(`Could not open the model picker. Check your access and try ${command} model again.`);
     }
   });
 
@@ -66,7 +66,7 @@ export function createModelPicker({ chat, loadConfig, listModels, setting, now =
       if (entry?.viewId && entry.userId === userId(event) && !closed) {
         await event.adapter?.webClient?.views.update({ view_id: entry.viewId, view: {
           type: "modal", callback_id: "pipa_model_notice", title: { type: "plain_text", text: "Pipa model" }, close: { type: "plain_text", text: "Close" },
-          blocks: [{ type: "section", text: { type: "plain_text", text: "Could not load models. Check your access and OpenCode connection, then reopen /pipa model." } }],
+          blocks: [{ type: "section", text: { type: "plain_text", text: `Could not load models. Check your access and OpenCode connection, then reopen ${command} model.` } }],
         } }).catch(() => undefined);
       }
       return [];
@@ -85,7 +85,7 @@ export function createModelPicker({ chat, loadConfig, listModels, setting, now =
       pending.delete(event.privateMetadata);
       return confirmation(`${model.name || model.modelID} saved. Subsequent ordinary requests use it, including in existing threads. Newly created routines inherit it; existing routines are unchanged.`);
     } catch {
-      return { action: "errors", errors: { [inputId]: "Could not save. Check your access and OpenCode connection, then reopen /pipa model." } };
+      return { action: "errors", errors: { [inputId]: `Could not save. Check your access and OpenCode connection, then reopen ${command} model.` } };
     }
   });
   chat.onModalClose?.("pipa_model", (event) => {

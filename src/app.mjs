@@ -3,7 +3,7 @@ import path from "node:path";
 import { Chat, Modal, TextInput } from "chat";
 import { createSlackAdapter } from "@chat-adapter/slack";
 import { createMemoryState } from "@chat-adapter/state-memory";
-import { canonicalWorkingDirectory, createManifest, createModelSetting, createSessionStore, loadConfig, pipaPaths, saveConfig } from "./state.mjs";
+import { canonicalWorkingDirectory, createManifest, createModelSetting, createSessionStore, loadConfig, pipaPaths, saveConfig, slackCommandName } from "./state.mjs";
 import { createModelPicker } from "./models.mjs";
 import { createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, PipaRestartingError, PipaStoppedError, runOpenCodeVersion, startSocketOpenCodeServer } from "./opencode.mjs";
 import { assertRoutineDestinationAllowed, createRoutineScheduler, loadRoutineState } from "./routines.mjs";
@@ -36,6 +36,7 @@ export async function startPipa(options = {}) {
   options.signal?.throwIfAborted();
   const paths = options.paths ?? pipaPaths();
   const config = options.config ?? await loadConfig(paths.config);
+  const command = slackCommandName(config.botName);
   const loadCurrentConfig = options.loadCurrentConfig ?? (() => loadConfig(paths.config));
   options.signal?.throwIfAborted();
   const slackAuth = await (options.checkSlackToken ?? checkSlackToken)(config.slackBotToken);
@@ -166,7 +167,7 @@ export async function startPipa(options = {}) {
       return { status: "succeeded" };
     },
   }) : null;
-  const modelPicker = createModelPicker({ chat, loadConfig: loadCurrentConfig,
+  const modelPicker = createModelPicker({ chat, command, loadConfig: loadCurrentConfig,
     listModels: () => executor.listModels(config.workingDirectory), setting: createModelSetting(paths.config) });
   chat.onAction?.(interactions.onAction);
   chat.onModalSubmit?.("pipa_custom", interactions.onCustomAnswer);

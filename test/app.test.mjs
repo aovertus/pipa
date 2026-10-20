@@ -13,6 +13,12 @@ import { createSessionStore, pipaPaths, writePrivateJson } from "../src/state.mj
 
 const startPipa = (options) => startPipaRuntime({ routinesEnabled: false, ...(options.config && !options.paths ? { loadCurrentConfig: async () => options.config } : {}), ...options });
 
+test("invalid command names fail before Slack or OpenCode startup", async () => {
+  let started = false;
+  await assert.rejects(startPipa({ config: { botName: "!!!" }, checkSlackToken: async () => { started = true; }, startServer: async () => { started = true; } }), /Bot name/u);
+  assert.equal(started, false);
+});
+
 test("a delayed model read cannot let an older message supersede a newer one", async () => {
   const entered = Promise.withResolvers();
   const release = Promise.withResolvers();

@@ -11,9 +11,9 @@ import { startPipa } from "../src/app.mjs";
 import { createModelPicker } from "../src/models.mjs";
 import { createModelSetting, createSessionStore, loadConfig, pipaPaths, writePrivateJson } from "../src/state.mjs";
 
-test("native Slack adapter routes command, options, modal save, cancel and same-session requests", async (t) => {
+for (const [botName, command] of [["Chopper", "/chopper"], ["Pipwick", "/pipwick"]]) test(`native Slack adapter routes ${command} with options, Save, Cancel and same-session requests`, async (t) => {
   const paths = pipaPaths(await mkdtemp(path.join(os.tmpdir(), "pipa-native-model-")));
-  const config = { botName: "Pipa", workingDirectory: "/work", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", allowedSlackUserIds: ["U1"], allowedSlackChannelIds: ["C1"] };
+  const config = { botName, workingDirectory: "/work", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", allowedSlackUserIds: ["U1"], allowedSlackChannelIds: ["C1"] };
   await writePrivateJson(paths.config, config);
   const adapter = createSlackAdapter({ signingSecret: "test", botToken: "xoxb-test", botUserId: "UPIPA", userName: "Pipa" });
   adapter.lookupUser = async () => ({ displayName: "User" });
@@ -33,11 +33,15 @@ test("native Slack adapter routes command, options, modal save, cancel and same-
   t.after(() => app.shutdown());
   const open = async () => {
     const waiting = [];
-    await adapter.handleSlashCommand(new URLSearchParams({ command: "/pipa", text: "model", user_id: "U1", channel_id: "C1", trigger_id: "trigger" }), { waitUntil: (p) => waiting.push(p) });
+    await adapter.handleSlashCommand(new URLSearchParams({ command, text: "model", user_id: "U1", channel_id: "C1", trigger_id: "trigger" }), { waitUntil: (p) => waiting.push(p) });
     await Promise.all(waiting);
     assert.ok(views.length, JSON.stringify(notices));
     return views.at(-1);
   };
+  const ignored = [];
+  await adapter.handleSlashCommand(new URLSearchParams({ command: "/pipa", text: "model", user_id: "U1", channel_id: "C1", trigger_id: "trigger" }), { waitUntil: (p) => ignored.push(p) });
+  await Promise.all(ignored);
+  assert.equal(views.length, 0, "custom installations do not register a /pipa alias");
   for (const [index, expected] of models.entries()) {
     const view = await open();
     assert.equal(view.blocks[0].type, "input");
@@ -81,7 +85,7 @@ test("private picker opens/searches/saves/reopens/cancels without inference and 
   };
   let modal;
   let discoveries = 0;
-  const picker = createModelPicker({ chat, loadConfig: () => loadConfig(paths.config), setting: createModelSetting(paths.config), listModels: async () => { discoveries++; return models; } });
+  const picker = createModelPicker({ chat, command: "/pipa", loadConfig: () => loadConfig(paths.config), setting: createModelSetting(paths.config), listModels: async () => { discoveries++; return models; } });
   const user = { userId: "U1" };
   const messages = [];
   const opening = { user, text: "model", channel: { id: "slack:C1", postEphemeral: async (...args) => messages.push(args) }, openModal: async (value) => { modal = value; return { viewId: "V1" }; } };
@@ -112,12 +116,12 @@ test("private picker opens/searches/saves/reopens/cancels without inference and 
 test("picker failure paths never persist and search output respects Slack bounds", async () => {
   const handlers = {};
   const chat = { onSlashCommand: (_id, fn) => { handlers.open = fn; }, onOptionsLoad: (fn) => { handlers.search = fn; }, onModalSubmit: (_id, fn) => { handlers.save = fn; }, onModalClose: (_id, fn) => { handlers.cancel = fn; } };
-  const config = { allowedSlackUserIds: ["U1"], allowedSlackChannelIds: ["C1"] };
+  const config = { botName: "Pipa Test!", allowedSlackUserIds: ["U1"], allowedSlackChannelIds: ["C1"] };
   const models = Array.from({ length: 120 }, (_, id) => ({ providerID: "provider", modelID: String(id), name: "n".repeat(200) }));
   let clock = 0;
   let failed = false;
   let writes = 0;
-  const picker = createModelPicker({ chat, now: () => clock, loadConfig: async () => config,
+  const picker = createModelPicker({ chat, command: "/pipa-test", now: () => clock, loadConfig: async () => config,
     listModels: async () => { if (failed) throw new Error("private upstream details"); return models; },
     setting: { save: async (_model, authorize) => { authorize(config); writes++; throw new Error("disk unavailable"); } } });
   let modal;
@@ -126,6 +130,7 @@ test("picker failure paths never persist and search output respects Slack bounds
   const event = { user, text: "model", channel: { id: "slack:C1", postEphemeral: async (...args) => privateReplies.push(args) }, openModal: async (value) => { modal = value; return { viewId: "V1" }; } };
   for (const text of ["", "unknown"]) await handlers.open({ ...event, text });
   assert.equal(privateReplies.length, 2);
+  assert.ok(privateReplies.every((args) => args[1].includes("/pipa-test model") && !args[1].includes("/pipa model")));
   assert.ok(privateReplies.every((args) => args[2].fallbackToDM === false));
   await handlers.open(event);
   const id = modal.children[0].id;
@@ -143,7 +148,9 @@ test("picker failure paths never persist and search output respects Slack bounds
   assert.equal((await handlers.save(save)).action, "errors");
   assert.equal(writes, 0);
   failed = false;
-  assert.equal((await handlers.save(save)).action, "errors");
+  const failedWrite = await handlers.save(save);
+  assert.equal(failedWrite.action, "errors");
+  assert.match(Object.values(failedWrite.errors)[0], /reopen \/pipa-test model/u);
   assert.equal(writes, 1);
   config.allowedSlackChannelIds = ["C2"];
   assert.deepEqual(await handlers.search(search), []);

@@ -4,6 +4,8 @@ Date: 2026-10-20. Harness/model: OpenCode / `openai/gpt-6.1-sol`.
 
 ## Result
 
+Current release target: **0.5.5**, corrected from the intermediate `0.6.0` bump at the user's request. No tag, npm publish, merge, or production restart has been performed.
+
 Implemented installation-wide model persistence, ordinary request selection, routine snapshots, native Slack picker, manifest command/scope, and setup documentation.
 The initial checkout collision was resolved with the user's authorization: unrelated no-reply work is preserved in stash `deferred no-reply changes before STU-722`. The stash and pre-existing `tmp/` evaluation data remain untouched.
 The production Pipa process, production Slack app settings, and production config were not modified or restarted. A distinct temporary Slack app/profile was created for live smoke, then removed after verification.
@@ -52,7 +54,23 @@ Exact successful commands (exit 0):
 
 The native routing test replaces only outbound Slack calls. It does not start a Socket listener, create Slack messages, or use real Slack credentials. It proves SDK callback and request-boundary behavior, not live provider completion.
 
-## Live smoke evidence
+## Installation-name command correction
+
+The user superseded the original universal-command design: the registered slash command now derives from configured `botName`. Manifest generation and handler startup share `slackCommandName`; all usage/error instructions use that command. Examples: `Pipa` -> `/pipa`, `Chopper` -> `/chopper`, `Pipwick` -> `/pipwick`, `Workshop "Bot"` -> `/workshop-bot`, `Café 🧪` -> `/cafe`.
+
+Normalization uses Unicode compatibility decomposition with combining-mark removal, lowercase ASCII letters/digits, hyphen-separated non-alphanumeric runs, edge-hyphen removal, and at most 31 characters after `/`. Names with no usable ASCII letter/digit are rejected before Slack/OpenCode startup. Distinct names may normalize identically; operators must choose distinct resulting commands. No alias, command-override config, dependency, or model-selection lifetime change was added.
+
+Slack's [manifest reference](https://docs.slack.dev/reference/app-manifest/) specifies a maximum of 32 characters including `/`. The app-management form was inspected without saving and states that commands start with `/`, are lowercase, and contain no spaces. The implementation uses the conservative letter/digit/hyphen subset. Slack's [command guide](https://docs.slack.dev/interactivity/implementing-slash-commands/) confirms that commands are not namespaced and the most recently installed app wins a collision.
+
+Focused tests first failed on the missing normalization export, universal `/pipa` dispatch for custom installations, and incorrect usage guidance. Native SDK/adapter tests now use `/chopper` and `/pipwick`, reject the universal alias for those installations, and exercise options/Save/reopen/Cancel and same-session model changes. The state suite covers punctuation, accents, length boundaries, and invalid names; package smoke checks `Pack Bot` -> `/pack-bot`. This is automated custom-command coverage, not a new live custom-command smoke.
+
+Existing apps must update their Slack command registration to match local `botName` and restart that installation after a local name change. Renaming the app/bot in Slack alone does not change registration or Pipa's config.
+
+Correction verification: focused state/model/app tests, `npm test -- --test-reporter=dot`, and `npm run test:pack` all exited 0 for `0.5.5`. Simplification made no further changes. The correction-only code review against `30e0c3e` completed with no actionable findings (`run_id: stu722-command-review`); passes were inline with no independent agreement promotion. No lint/typecheck is configured. CI on the corrected commit is reported through the PR rather than rewriting historical results below.
+
+## Historical live smoke evidence (before command-name correction)
+
+This smoke used the then-universal `/pipa` command. It remains evidence for model selection/history/Cancel/restart semantics, but does not prove live custom-command registration in the revised implementation. The custom commands are covered by the native automated adapter tests described above.
 
 The initial absence of an isolated profile was resolved using the already authenticated app-management browser. The generated manifest was accepted by Slack to create **Pipa Model Test 722**, app `A0CA6RMHH7H`, with its own app/bot tokens, `/pipa`, `commands`, and Socket Mode. The test bot was invited to the allowed `#test-prod-pipa` channel. Only this distinct profile's Socket listener was started; it attached to the existing OpenCode server with a separate temporary workspace and never owned or restarted that server.
 

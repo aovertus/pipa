@@ -12,7 +12,7 @@ const MANIFEST = {
     long_description: "Pippette connects Slack to the OpenCode installed on your computer. Send text requests from Slack and receive replies in threads for the local folder you choose. OpenCode runs locally, and your Slack credentials stay on your machine. Learn more at usepipa.com.",
   },
   features: {
-    slash_commands: [{ command: "/pipa", description: "Configure this Pipa installation", usage_hint: "model", should_escape: false }],
+    slash_commands: [{ description: "Configure this Pipa installation", usage_hint: "model", should_escape: false }],
     bot_user: {
       display_name: "Pippette",
       always_online: true,
@@ -134,7 +134,15 @@ export function createManifest(botName) {
   manifest.display_information.description = manifest.display_information.description.replaceAll("Pippette", name);
   manifest.display_information.long_description = manifest.display_information.long_description.replaceAll("Pippette", name);
   manifest.features.bot_user.display_name = name;
+  manifest.features.slash_commands[0].command = slackCommandName(name);
   return manifest;
+}
+
+export function slackCommandName(botName) {
+  const slug = validateBotName(botName).normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase()
+    .replace(/[^a-z0-9]+/gu, "-").replace(/^-+|-+$/gu, "").slice(0, 31).replace(/-+$/u, "");
+  if (!slug) throw new Error("Bot name must contain a letter or number that can form an ASCII Slack command.");
+  return `/${slug}`;
 }
 
 export function createManifestUrl(manifest) {

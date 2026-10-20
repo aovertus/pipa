@@ -4,7 +4,23 @@ import { writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { acquireInstanceLock, createManifest, createManifestUrl, createSessionStore, createModelSetting, loadConfig, loadSessions, pipaPaths, saveConfig, stopInstance, writePrivateJson } from "../src/state.mjs";
+import { acquireInstanceLock, createManifest, createManifestUrl, createSessionStore, createModelSetting, loadConfig, loadSessions, pipaPaths, saveConfig, slackCommandName, stopInstance, writePrivateJson } from "../src/state.mjs";
+
+test("installation command names are shared with the manifest and fit Slack's limit", () => {
+  for (const [name, command] of [
+    ["Pipa", "/pipa"], ["Chopper", "/chopper"], ["Pipwick", "/pipwick"],
+    ['  Workshop "Bot"  ', "/workshop-bot"], ["Pipa_Test.2!", "/pipa-test-2"],
+    ["Café 🧪", "/cafe"], ["A".repeat(35), `/${"a".repeat(31)}`],
+    [`${"A".repeat(30)} !bot`, `/${"a".repeat(30)}`],
+  ]) {
+    assert.equal(slackCommandName(name), command);
+    assert.equal(createManifest(name).features.slash_commands[0].command, command);
+    assert.match(command, /^\/[a-z0-9-]{1,31}$/u);
+  }
+  for (const name of ["", "!!!", "🧪", "A".repeat(36), "line\nbreak"]) {
+    assert.throws(() => slackCommandName(name), /Bot name/u);
+  }
+});
 
 test("model saves serialize, reload unrelated fields, and recover after failed persistence", async () => {
   const paths = pipaPaths(await mkdtemp(path.join(os.tmpdir(), "pipa-model-")));
@@ -40,7 +56,7 @@ test("manifest preserves approved capabilities and substitutes the bot name", ()
   assert.ok(manifest.oauth_config.scopes.bot.includes("assistant:write"));
   assert.ok(manifest.oauth_config.scopes.bot.includes("users:read"));
   assert.ok(manifest.oauth_config.scopes.bot.includes("commands"));
-  assert.equal(manifest.features.slash_commands[0].command, "/pipa");
+  assert.equal(manifest.features.slash_commands[0].command, "/workshop-bot");
   assert.equal(manifest.features.slash_commands[0].usage_hint, "model");
   assert.deepEqual(manifest.settings.event_subscriptions.bot_events, ["app_mention", "message.channels", "message.groups"]);
   assert.equal(manifest.settings.interactivity.is_enabled, true);
