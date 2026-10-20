@@ -134,7 +134,8 @@ export function createManifest(botName) {
   manifest.display_information.description = manifest.display_information.description.replaceAll("Pippette", name);
   manifest.display_information.long_description = manifest.display_information.long_description.replaceAll("Pippette", name);
   manifest.features.bot_user.display_name = name;
-  manifest.features.slash_commands[0].command = slackCommandName(name);
+  const commandTemplate = manifest.features.slash_commands[0];
+  manifest.features.slash_commands = slackCommandNames(name).map((command) => ({ ...commandTemplate, command }));
   return manifest;
 }
 
@@ -143,6 +144,10 @@ export function slackCommandName(botName) {
     .replace(/[^a-z0-9]+/gu, "-").replace(/^-+|-+$/gu, "").slice(0, 31).replace(/-+$/u, "");
   if (!slug) throw new Error("Bot name must contain a letter or number that can form an ASCII Slack command.");
   return `/${slug}`;
+}
+
+export function slackCommandNames(botName) {
+  return [...new Set([slackCommandName(botName), "/pipa"])];
 }
 
 export function createManifestUrl(manifest) {

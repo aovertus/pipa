@@ -3,7 +3,7 @@ import path from "node:path";
 import { Chat, Modal, TextInput } from "chat";
 import { createSlackAdapter } from "@chat-adapter/slack";
 import { createMemoryState } from "@chat-adapter/state-memory";
-import { canonicalWorkingDirectory, createManifest, createModelSetting, createSessionStore, loadConfig, pipaPaths, saveConfig, slackCommandName } from "./state.mjs";
+import { canonicalWorkingDirectory, createManifest, createModelSetting, createSessionStore, loadConfig, pipaPaths, saveConfig, slackCommandNames } from "./state.mjs";
 import { createModelPicker } from "./models.mjs";
 import { createOpenCodeExecutor, MAX_ATTACHMENT_BYTES, PipaRestartingError, PipaStoppedError, runOpenCodeVersion, startSocketOpenCodeServer } from "./opencode.mjs";
 import { assertRoutineDestinationAllowed, createRoutineScheduler, loadRoutineState } from "./routines.mjs";
@@ -36,7 +36,7 @@ export async function startPipa(options = {}) {
   options.signal?.throwIfAborted();
   const paths = options.paths ?? pipaPaths();
   const config = options.config ?? await loadConfig(paths.config);
-  const command = slackCommandName(config.botName);
+  const commands = slackCommandNames(config.botName);
   const loadCurrentConfig = options.loadCurrentConfig ?? (() => loadConfig(paths.config));
   options.signal?.throwIfAborted();
   const slackAuth = await (options.checkSlackToken ?? checkSlackToken)(config.slackBotToken);
@@ -167,7 +167,7 @@ export async function startPipa(options = {}) {
       return { status: "succeeded" };
     },
   }) : null;
-  const modelPicker = createModelPicker({ chat, command, loadConfig: loadCurrentConfig,
+  const modelPicker = createModelPicker({ chat, botName: config.botName, commands, loadConfig: loadCurrentConfig,
     listModels: () => executor.listModels(config.workingDirectory), setting: createModelSetting(paths.config) });
   chat.onAction?.(interactions.onAction);
   chat.onModalSubmit?.("pipa_custom", interactions.onCustomAnswer);
@@ -770,10 +770,10 @@ function normalizeGrantedScopes(value) {
 function warnMissingSlackScopes(auth, warn = (message) => process.stderr.write(`${message}\n`)) {
   if (!Array.isArray(auth?.grantedScopes)) return;
   const missing = ["channels:read", "assistant:write"].filter((scope) => !auth.grantedScopes.includes(scope));
-  if (!missing.length) return;
   const scopes = missing.join(", ");
   try {
-    warn(`Pipa warning: Slack bot token is missing recommended ${missing.length === 1 ? "scope" : "scopes"} ${scopes}. Add ${missing.length === 1 ? "it" : "them"} and reinstall or reauthorize the Slack app.`);
+    if (missing.length) warn(`Pipa warning: Slack bot token is missing recommended ${missing.length === 1 ? "scope" : "scopes"} ${scopes}. Add ${missing.length === 1 ? "it" : "them"} and reinstall or reauthorize the Slack app.`);
+    if (!auth.grantedScopes.includes("commands")) warn("Pipa warning: Slack bot token is missing the commands scope. Model slash commands are unavailable until matching commands are registered and granted in Slack. Run `pipa manifest` for the local template, merge the command definitions and commands scope into your existing Slack app, then reinstall or reauthorize it. Existing mentions and thread replies can continue; do not rerun `pipa init`.");
   } catch {}
 }
 

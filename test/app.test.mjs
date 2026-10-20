@@ -113,7 +113,7 @@ test("init and start warn about known missing Slack scopes without blocking", as
   const paths = pipaPaths(home);
   const warnings = [];
   let checks = 0;
-  const checkSlackToken = async () => ({ ok: true, grantedScopes: checks++ === 0 ? ["assistant:write"] : ["channels:read"] });
+  const checkSlackToken = async () => ({ ok: true, grantedScopes: checks++ === 0 ? ["assistant:write", "commands"] : ["channels:read", "commands"] });
   await initializePipa({
     botName: "Pipa",
     slackAppToken: "xapp-test",
@@ -149,7 +149,7 @@ test("init and start warn about known missing Slack scopes without blocking", as
 
 test("complete or unknown Slack scope metadata does not warn", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "pipa-scopes-"));
-  for (const grantedScopes of [["channels:read", "assistant:write"], undefined]) {
+  for (const grantedScopes of [["channels:read", "assistant:write", "commands"], undefined]) {
     const warnings = [];
     await initializePipa({
       botName: "Pipa",
@@ -165,6 +165,21 @@ test("complete or unknown Slack scope metadata does not warn", async () => {
     });
     assert.deepEqual(warnings, []);
   }
+});
+
+test("missing commands scope explains the existing-app upgrade without blocking ordinary mentions", async () => {
+  const warnings = [];
+  const delivery = await deliveryApp({ text: "Still working." }, { slackAuth: { ok: true, grantedScopes: ["channels:read", "assistant:write"] }, warn: (message) => warnings.push(message) });
+  await delivery.mention();
+  await waitFor(() => delivery.posts.length === 1);
+  assert.deepEqual(delivery.posts, [{ markdown: "Still working." }]);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /missing.*commands/iu);
+  assert.match(warnings[0], /pipa manifest/u);
+  assert.match(warnings[0], /register|registration/iu);
+  assert.match(warnings[0], /reinstall or reauthorize/u);
+  assert.match(warnings[0], /mentions.*thread/iu);
+  await delivery.app.shutdown();
 });
 
 test("starts and health-checks OpenCode before Slack, then stops only the owned server", async () => {
@@ -831,7 +846,7 @@ test("inline fallback prefers paragraphs and lines and preserves fenced code acr
   await delivery.app.shutdown();
 });
 
-async function deliveryApp(result, { failFiles = false } = {}) {
+async function deliveryApp(result, { failFiles = false, slackAuth = { ok: true }, warn } = {}) {
   const handlers = {};
   const posts = [];
   const reactions = [];
@@ -844,7 +859,8 @@ async function deliveryApp(result, { failFiles = false } = {}) {
   const app = await startPipa({
     chat,
     executor: { runTurn: async () => ({ ...result, sessionId: "ses_1" }), stopAll() {} },
-    checkSlackToken: async () => ({ ok: true }),
+    checkSlackToken: async () => slackAuth,
+    warn,
     sessionStore: { keys: () => [], get: () => null, set: async () => undefined },
     config: { botName: "Pipa", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", workingDirectory: "/work" },
   });

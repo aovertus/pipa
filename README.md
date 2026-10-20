@@ -39,7 +39,7 @@ npm install --global @usepipa/pipa
 pipa init
 ```
 
-`pipa init` guides you through creating and installing the Slack app and saving its local configuration. The generated manifest includes `channels:read`, `assistant:write`, and `commands`, plus a slash command derived from your configured bot name (`Chopper` gets `/chopper`). If an existing installation has not granted a recommended scope, `pipa init` and `pipa start` print reauthorization guidance but continue running.
+`pipa init` guides you through creating and installing the Slack app and saving its local configuration. The generated manifest includes `channels:read`, `assistant:write`, and `commands`, plus a slash command derived from your configured bot name (`Chopper` gets `/chopper`) and a `/pipa` compatibility alias. For `Pipa`, these are the same command and appear only once. Review the alias collision guidance below before installing multiple apps in one workspace. Known missing scopes produce upgrade guidance without blocking startup.
 
 3. Start Pipa:
 
@@ -112,11 +112,11 @@ pipa start
 
 ### Choosing a model
 
-Type your installation's command followed by `model` in an allowed Slack channel: `/chopper model` for `Chopper`, `/pipwick model` for `Pipwick`, or `/pipa model` for `Pipa`. A private native modal shows the saved selection, or **OpenCode default** when none is saved. Search configured model names or IDs, choose one, and Save. Cancel leaves the setting unchanged. The command uses the existing channel and human-user allowlists, checked again on search and Save.
+Type your installation's command followed by `model` in an allowed Slack channel: `/chopper model` for `Chopper`, `/pipwick model` for `Pipwick`, or the `/pipa model` compatibility alias when registered to that app. Both forms use the same private native modal, authorization checks, and setting. The modal label and saved confirmation identify the installation by name. Search configured model names or IDs, choose one, and Save. Cancel leaves the setting unchanged. The existing channel and human-user allowlists are checked again on search and Save.
 
 The command comes from the `botName` saved by `pipa init`. Pipa decomposes accented Latin characters, removes combining marks, lowercases the name, replaces runs of spaces/punctuation/other non-ASCII characters with `-`, trims edge hyphens, and limits the part after `/` to 31 characters (trimming any resulting trailing hyphen). For example, `Workshop "Bot"` becomes `/workshop-bot` and `Café 🧪` becomes `/cafe`. Names that cannot produce any ASCII letter or digit are rejected. This uses a conservative lowercase-letter/digit/hyphen subset within Slack's 32-character limit including `/`.
 
-Choose distinct resulting commands for installations in the same workspace. Case, punctuation, or truncation can make different names normalize to the same command; names are not automatically disambiguated. Slack slash commands are not namespaced, and the most recently installed app wins a collision. Custom installations do not also register a universal `/pipa` alias.
+**Alias collision:** [Slack slash commands are not namespaced](https://docs.slack.dev/interactivity/implementing-slash-commands/#naming_your_command). If multiple apps register `/pipa`, Slack routes it to the most recently installed app; Pipa cannot redirect it to another installation. In a multi-app workspace, keep distinct named commands and omit the generic alias from other apps' Slack manifests, or assign `/pipa` to exactly one app. Check the installation name shown in the modal before saving. Case, punctuation, or truncation can also make different names normalize identically; choose distinct resulting names.
 
 The selection is installation-wide and stored as optional `defaultModel: { "providerID": "openai", "modelID": "your-model-id" }` in the existing `.pipa/config.json`. It takes effect without restarting Pipa: subsequent ordinary requests use it, including replies in existing threads. Running requests retain their original selection and thread history stays in the same session. When unset, Pipa omits the override and OpenCode chooses its default. This setting does not select models for separate subagents or external clients.
 
@@ -124,7 +124,41 @@ New routines snapshot the selection when created; preview JSON shows that snapsh
 
 Search reads only the configured OpenCode provider catalog. A listed model may still lack credentials or quota; saving never runs inference to check it. Provider errors are surfaced without silently switching to another model. Abandoned pickers expire after 30 minutes; reopen your installation's model command to continue.
 
-**Existing Slack apps:** add or replace the slash-command definition with the command matching the configured `botName`, and grant the `commands` bot scope in Slack app settings. Retain Socket Mode and interactivity, then reinstall or reauthorize the app. Renaming the app/bot in Slack alone does not rename its registered command or update Pipa's config. After changing `botName` locally, update Slack's matching command registration and restart that installation to load its new handler. Generating a local manifest alone does not update the installed Slack app. A running older Pipa needs a normal upgrade before the command is available.
+### Upgrading an existing installation
+
+**An npm upgrade updates local code only. It does not update the installed Slack app, register commands, or grant scopes.** Existing mentions and thread replies still work without model-command registration. Do not rerun `pipa init` or replace credentials to add this feature.
+
+After `0.5.5` is published, use the same `PIPA_HOME` as your existing installation (leave it unset for the default `~/.pipa` profile):
+
+```sh
+npm install --global @usepipa/pipa@0.5.5
+pipa --version
+pipa manifest > "$HOME/pipa-slack-manifest-0.5.5.json"
+```
+
+`pipa manifest` reads the existing profile and prints the current **local template** without tokens. It does not write config, sessions, routines, or the cached manifest, call Slack, or run inference. It is not an export of your app's current remote/custom configuration.
+
+1. Open your **existing app** in [Slack App Management](https://api.slack.com/apps). Keep a copy of its current remote manifest.
+2. In **App Manifest**, merge the generated `features.slash_commands` entries you want (the named command and optionally `/pipa`) and add `commands` to `oauth_config.scopes.bot`. Preserve unrelated remote settings, existing commands, scopes, Socket Mode, and interactivity. **Do not replace a customized remote manifest wholesale with the local template.** Alternatively, add the matching commands under **Slash Commands** and add the bot scope under **OAuth & Permissions**.
+3. Save, then reinstall or reauthorize that same app. Retain your current tokens unless Slack rotates them; if it does, update the existing local config securely rather than reinitializing the profile.
+4. Restart the same profile to load the upgraded runtime:
+
+```sh
+pipa restart
+pipa restart --status
+```
+
+Restart reports **requested** first; inspect status for completion. Then try `/chopper model` (for configured `Chopper`) and `/pipa model` if the alias is registered to that app. Merely recognizing an alias in Pipa cannot bypass missing Slack registration. A known missing `commands` scope produces a warning at startup; scope metadata alone cannot verify command registration, and an absent warning does not prove it is installed.
+
+Before npm publication, preview the feature branch from this repo without reinstalling or reinitializing your profile:
+
+```sh
+npm ci
+node bin/pipa.mjs --version
+node bin/pipa.mjs manifest > "$HOME/pipa-slack-manifest-preview.json"
+```
+
+For running the unpublished branch, use the separate test app/profile procedure in `CONTRIBUTING.md`; do not start a second Socket listener with a running installation's credentials. Renaming an app/bot in Slack alone does not update command registration or Pipa's local `botName`. A local name change needs matching Slack registration and an installation restart.
 
 ### Routines
 
@@ -193,6 +227,7 @@ pipa stop       Stop the running local Pipa process
 pipa restart [--channel <id> [--thread <ts>]]  Request a detached restart
 pipa restart --status  Inspect the latest durable restart outcome
 pipa routine    Create and manage local scheduled routines
+pipa manifest   Print the current local Slack manifest template for an existing profile
 pipa --version  Print the installed version
 ```
 

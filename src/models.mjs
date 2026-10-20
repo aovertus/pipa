@@ -9,7 +9,8 @@ function modelOption(model) {
   });
 }
 
-export function createModelPicker({ chat, command, loadConfig, listModels, setting, now = Date.now }) {
+export function createModelPicker({ chat, botName, commands, loadConfig, listModels, setting, now = Date.now }) {
+  const command = commands[0];
   const pending = new Map();
   let closed = false;
   const userId = (event) => event.user?.userId ?? event.user?.id;
@@ -23,7 +24,7 @@ export function createModelPicker({ chat, command, loadConfig, listModels, setti
   };
   const confirmation = (message) => ({ action: "update", modal: Modal({ callbackId: "pipa_model_notice", title: "Pipa model", submitLabel: "Done", children: [CardText(message)] }) });
 
-  chat.onSlashCommand?.(command, async (event) => {
+  chat.onSlashCommand?.(commands, async (event) => {
     const reply = (text) => event.channel.postEphemeral(event.user, text, { fallbackToDM: false });
     if (closed) return;
     if (event.text.trim() !== "model") return reply(`Use ${command} model to choose the default for this Pipa installation.`);
@@ -41,7 +42,7 @@ export function createModelPicker({ chat, command, loadConfig, listModels, setti
       pending.set(token, entry);
       const opened = await event.openModal(Modal({
         callbackId: "pipa_model", privateMetadata: token, title: "Pipa model", submitLabel: "Save", closeLabel: "Cancel", notifyOnClose: true,
-        children: [ExternalSelect({ id: `pipa_model_${token}`, label: "Default for this Pipa installation.", minQueryLength: 0,
+        children: [ExternalSelect({ id: `pipa_model_${token}`, label: `Default for ${botName} (this Pipa installation).`, minQueryLength: 0,
           placeholder: "OpenCode default", ...(config.defaultModel ? { initialOption: modelOption(config.defaultModel) } : {}) })],
       }));
       if (!opened?.viewId) throw new Error("modal unavailable");
@@ -83,7 +84,7 @@ export function createModelPicker({ chat, command, loadConfig, listModels, setti
       if (!model) return { action: "errors", errors: { [inputId]: "Choose an available configured model." } };
       await setting.save({ providerID: model.providerID, modelID: model.modelID }, (config) => authorize(entry, event, config));
       pending.delete(event.privateMetadata);
-      return confirmation(`${model.name || model.modelID} saved. Subsequent ordinary requests use it, including in existing threads. Newly created routines inherit it; existing routines are unchanged.`);
+      return confirmation(`${botName}: ${model.name || model.modelID} saved. Subsequent ordinary requests use it, including in existing threads. Newly created routines inherit it; existing routines are unchanged.`);
     } catch {
       return { action: "errors", errors: { [inputId]: `Could not save. Check your access and OpenCode connection, then reopen ${command} model.` } };
     }

@@ -18,13 +18,15 @@ For model-selection changes, iterate with `node --test test/state.test.mjs test/
 
 ### Isolated Slack model smoke
 
-Use a distinct Slack test app and a separate `PIPA_HOME` (the parent of `.pipa`), with its own app/bot tokens, working directory, and channel/user allowlists. Install the slash command derived from its configured `botName` (for example, `Chopper` -> `/chopper`) and grant `commands`. Enable Socket Mode and interactivity, reinstall or reauthorize, and invite the test app to the allowed channel. The generated manifest and runtime must use the same normalized name; a Slack app/bot rename alone does not update command registration or local config. Never run a second Socket listener with production credentials or restart production Pipa for a smoke test.
+Use a distinct Slack test app and a separate `PIPA_HOME` (the parent of `.pipa`), with its own app/bot tokens, working directory, and channel/user allowlists. Install the slash command derived from its configured `botName` (for example, `Chopper` -> `/chopper`) and grant `commands`. The generated manifest also suggests `/pipa`; omit that alias when another app already owns it, unless intentionally transferring that command. Enable Socket Mode and interactivity, reinstall or reauthorize, and invite the test app to the allowed channel. The generated manifest and runtime must use the same normalized name; a Slack app/bot rename alone does not update command registration or local config. Never run a second Socket listener with production credentials or restart production Pipa for a smoke test.
 
 1. Open the installation's model command (for example `/chopper model`), search and save model A, then reopen to verify the selection.
 2. Send an ordinary request and inspect the completed OpenCode assistant message's provider/model metadata. HTTP acceptance or asking the model which model it is does not prove selection.
 3. Save model B and reply in that same Slack thread. Verify completed metadata names B and that the session/history is retained.
 4. Cancel another picker and verify no setting changed. Restart only the test profile and reopen to verify persistence.
 5. Record selected IDs, completed metadata, and a short existing Slack conversation link separately from automated outcomes. Clean up only test-owned processes/state. Without the isolated app/profile, record the live-smoke gap rather than presenting adapter tests as live evidence.
+
+For an existing profile, test `pipa manifest` as a read-only local-template export: credentials must be absent and config, sessions, routines, and cached manifest must remain unchanged. It must not contact Slack or claim to preserve unknown remote app settings. Use the README's existing-installation upgrade path instead of rerunning `pipa init`. Native adapter tests cover both named/alias entry points with the same user/channel authorization; inspect the installation identity in the modal before saving via a shared alias.
 
 ## Releases
 

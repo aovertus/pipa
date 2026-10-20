@@ -11,7 +11,7 @@ import { startPipa } from "../src/app.mjs";
 import { createModelPicker } from "../src/models.mjs";
 import { createModelSetting, createSessionStore, loadConfig, pipaPaths, writePrivateJson } from "../src/state.mjs";
 
-for (const [botName, command] of [["Chopper", "/chopper"], ["Pipwick", "/pipwick"]]) test(`native Slack adapter routes ${command} with options, Save, Cancel and same-session requests`, async (t) => {
+for (const [botName, command] of [["Chopper", "/chopper"], ["Chopper", "/pipa"], ["Pipwick", "/pipwick"], ["Pipwick", "/pipa"], ["Pipa", "/pipa"]]) test(`native Slack adapter routes ${command} to ${botName} with options, Save, Cancel and same-session requests`, async (t) => {
   const paths = pipaPaths(await mkdtemp(path.join(os.tmpdir(), "pipa-native-model-")));
   const config = { botName, workingDirectory: "/work", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", allowedSlackUserIds: ["U1"], allowedSlackChannelIds: ["C1"] };
   await writePrivateJson(paths.config, config);
@@ -39,18 +39,26 @@ for (const [botName, command] of [["Chopper", "/chopper"], ["Pipwick", "/pipwick
     return views.at(-1);
   };
   const ignored = [];
-  await adapter.handleSlashCommand(new URLSearchParams({ command: "/pipa", text: "model", user_id: "U1", channel_id: "C1", trigger_id: "trigger" }), { waitUntil: (p) => ignored.push(p) });
+  await adapter.handleSlashCommand(new URLSearchParams({ command: "/another-installation", text: "model", user_id: "U1", channel_id: "C1", trigger_id: "trigger" }), { waitUntil: (p) => ignored.push(p) });
   await Promise.all(ignored);
-  assert.equal(views.length, 0, "custom installations do not register a /pipa alias");
+  assert.equal(views.length, 0, "unrelated command names do not open this installation");
+  const denied = [];
+  await adapter.handleSlashCommand(new URLSearchParams({ command, text: "model", user_id: "U2", channel_id: "C1", trigger_id: "trigger" }), { waitUntil: (p) => denied.push(p) });
+  await Promise.all(denied);
+  assert.equal(views.length, 0, "both command forms enforce the user allowlist");
+  assert.equal((await loadConfig(paths.config)).defaultModel, undefined);
   for (const [index, expected] of models.entries()) {
     const view = await open();
     assert.equal(view.blocks[0].type, "input");
+    assert.ok(view.blocks[0].label.text.includes(botName));
     const actionId = view.blocks[0].element.action_id;
     const optionsResponse = await adapter.handleBlockSuggestion({ action_id: actionId, value: expected.providerID, user: { id: "U1" }, view: { id: `V${views.length}` } });
     const choices = (await optionsResponse.json()).options;
     assert.equal(choices.length, 1);
     const saved = await adapter.handleViewSubmission({ user: { id: "U1" }, view: { ...view, id: `V${views.length}`, state: { values: { [actionId]: { [actionId]: { selected_option: choices[0] } } } } } });
-    assert.equal((await saved.json()).response_action, "update");
+    const savedView = await saved.json();
+    assert.equal(savedView.response_action, "update");
+    assert.ok(JSON.stringify(savedView.view.blocks).includes(`${botName}:`));
     assert.deepEqual((await loadConfig(paths.config)).defaultModel, { providerID: expected.providerID, modelID: expected.modelID });
     const waiting = [];
     const message = adapter.parseMessage({ type: "message", channel: "C1", ts: `${index + 1}.0`, ...(index ? { thread_ts: "1.0" } : {}), text: index ? "follow up" : "<@UPIPA> begin", user: "U1" });
@@ -85,7 +93,7 @@ test("private picker opens/searches/saves/reopens/cancels without inference and 
   };
   let modal;
   let discoveries = 0;
-  const picker = createModelPicker({ chat, command: "/pipa", loadConfig: () => loadConfig(paths.config), setting: createModelSetting(paths.config), listModels: async () => { discoveries++; return models; } });
+  const picker = createModelPicker({ chat, botName: "Pipa", commands: ["/pipa"], loadConfig: () => loadConfig(paths.config), setting: createModelSetting(paths.config), listModels: async () => { discoveries++; return models; } });
   const user = { userId: "U1" };
   const messages = [];
   const opening = { user, text: "model", channel: { id: "slack:C1", postEphemeral: async (...args) => messages.push(args) }, openModal: async (value) => { modal = value; return { viewId: "V1" }; } };
@@ -121,7 +129,7 @@ test("picker failure paths never persist and search output respects Slack bounds
   let clock = 0;
   let failed = false;
   let writes = 0;
-  const picker = createModelPicker({ chat, command: "/pipa-test", now: () => clock, loadConfig: async () => config,
+  const picker = createModelPicker({ chat, botName: "Pipa Test!", commands: ["/pipa-test", "/pipa"], now: () => clock, loadConfig: async () => config,
     listModels: async () => { if (failed) throw new Error("private upstream details"); return models; },
     setting: { save: async (_model, authorize) => { authorize(config); writes++; throw new Error("disk unavailable"); } } });
   let modal;

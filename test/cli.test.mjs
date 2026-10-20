@@ -170,6 +170,31 @@ function json(result) {
   return JSON.parse(result.stdout);
 }
 
+test("manifest exports the current existing-profile template without secrets or state writes", async () => {
+  const { home, paths } = await setup();
+  const config = JSON.parse(await readFile(paths.config, "utf8"));
+  await writePrivateJson(paths.config, { ...config, botName: "Chopper", defaultModel: { providerID: "openai", modelID: "a" }, managementSecret: "must-not-be-exported" });
+  await writePrivateJson(paths.manifest, { customCachedManifest: true });
+  await writePrivateJson(paths.sessions, { "slack:C123:1.0": "ses_saved" });
+  await writePrivateJson(paths.routines, { version: 1, routines: [] });
+  const files = [paths.config, paths.manifest, paths.sessions, paths.routines];
+  const before = await Promise.all(files.map((file) => readFile(file, "utf8")));
+  const invoke = (...args) => spawnSync(process.execPath, [cli, "manifest", ...args], { encoding: "utf8", env: { ...process.env, PIPA_HOME: home } });
+  const result = invoke();
+  assert.equal(result.status, 0, result.stderr);
+  const manifest = JSON.parse(result.stdout);
+  assert.deepEqual(manifest.features.slash_commands.map((entry) => entry.command), ["/chopper", "/pipa"]);
+  assert.ok(manifest.oauth_config.scopes.bot.includes("commands"));
+  assert.equal(manifest.display_information.name, "Chopper");
+  assert.doesNotMatch(result.stdout, /test-app-token|test-bot-token|must-not-be-exported|defaultModel|ses_saved/u);
+  assert.notEqual(invoke("--apply").status, 0);
+  assert.deepEqual(await Promise.all(files.map((file) => readFile(file, "utf8"))), before);
+  await assert.rejects(readFile(paths.lock), { code: "ENOENT" });
+  const help = spawnSync(process.execPath, [cli, "manifest", "--help"], { encoding: "utf8", env: { ...process.env, PIPA_HOME: path.join(home, "unconfigured") } });
+  assert.equal(help.status, 0, help.stderr);
+  assert.match(help.stdout, /does not update Slack/iu);
+});
+
 test("preview normalizes schedules without writing state", async () => {
   const { home, paths } = await setup();
   const config = JSON.parse(await readFile(paths.config, "utf8"));
