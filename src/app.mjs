@@ -35,6 +35,7 @@ export async function startPipa(options = {}) {
   options.signal?.throwIfAborted();
   const paths = options.paths ?? pipaPaths();
   const config = options.config ?? await loadConfig(paths.config);
+  const loadCurrentConfig = options.loadCurrentConfig ?? (() => loadConfig(paths.config));
   options.signal?.throwIfAborted();
   const slackAuth = await (options.checkSlackToken ?? checkSlackToken)(config.slackBotToken);
   options.signal?.throwIfAborted();
@@ -119,6 +120,7 @@ export async function startPipa(options = {}) {
       try {
         result = await executor.runTurn({
           prompt: snapshot.prompt,
+          ...(snapshot.model ? { model: snapshot.model } : {}),
           sessionId: null,
           workingDirectory: config.workingDirectory,
           contextEnvironment: {
@@ -190,9 +192,11 @@ export async function startPipa(options = {}) {
     pending.push({ thread, message });
     pendingReactions.set(thread.id, pending);
     try {
+      const currentConfig = await loadCurrentConfig();
       const interactionContext = { thread };
       const result = await runner.enqueue(thread.id, {
         prompt,
+        ...(currentConfig.defaultModel ? { model: currentConfig.defaultModel } : {}),
         attachments,
         workingDirectory: config.workingDirectory,
         contextEnvironment: slackContext(thread, message),

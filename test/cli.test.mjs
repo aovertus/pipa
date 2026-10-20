@@ -172,10 +172,14 @@ function json(result) {
 
 test("preview normalizes schedules without writing state", async () => {
   const { home, paths } = await setup();
+  const config = JSON.parse(await readFile(paths.config, "utf8"));
+  config.defaultModel = { providerID: "openai", modelID: "model-a" };
+  await writePrivateJson(paths.config, config);
   const result = json(run(home, "create", "--prompt", "brief", "--timezone", "America/New_York", "--channel", "C123", "--every", "1d", "--times", "05:00", "--preview", "--json"));
   assert.equal(result.ok, true);
   assert.equal(result.preview, true);
   assert.equal(result.routine.prompt, "brief");
+  assert.deepEqual(result.routine.model, config.defaultModel);
   assert.deepEqual(result.routine.schedule, { type: "recurring", frequency: "daily", interval: 1, times: ["05:00"], weekdays: [], until: null });
   assert.deepEqual(result.routine.destination, { channelId: "C123", threadTs: null });
   await assert.rejects(readFile(paths.routines), { code: "ENOENT" });

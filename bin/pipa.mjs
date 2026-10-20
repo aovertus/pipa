@@ -137,7 +137,7 @@ async function routine(argv, io) {
   const changes = await routineInput(values, command === "create", now, config.workingDirectory);
   const options = { now, allowedChannelIds: config.allowedSlackChannelIds ?? [] };
   const result = command === "create"
-    ? await createRoutine({ id, ...changes }, { ...options, preview: values.preview === true })
+    ? await createRoutine({ id, ...changes, model: config.defaultModel ?? null }, { ...options, preview: values.preview === true })
     : await editRoutine(id, changes, options);
   const preview = command === "create" && values.preview === true;
   return writeRoutineResult(io.output, json, { routine: result, ...(preview ? { preview: true } : {}) }, preview

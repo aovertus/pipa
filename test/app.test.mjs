@@ -11,7 +11,7 @@ import { PipaRestartingError, PipaStoppedError } from "../src/opencode.mjs";
 import { createRoutineScheduler, normalizeRoutine } from "../src/routines.mjs";
 import { createSessionStore, pipaPaths, writePrivateJson } from "../src/state.mjs";
 
-const startPipa = (options) => startPipaRuntime({ routinesEnabled: false, ...options });
+const startPipa = (options) => startPipaRuntime({ routinesEnabled: false, ...(options.config && !options.paths ? { loadCurrentConfig: async () => options.config } : {}), ...options });
 
 test("init validates dependencies before replacing config", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "pipa-init-"));
@@ -1086,6 +1086,7 @@ test("routine scheduler uses an exact destination and binds replies to its fresh
   await writePrivateJson(paths.config, config);
   const routine = normalizeRoutine({
     id: "scheduled",
+    model: { providerID: "openai", modelID: "model-a" },
     prompt: "  exact $(prompt)\n",
     schedule: { type: "once", at: "2026-08-29T13:00:00Z" },
     timezone: "UTC",
@@ -1147,7 +1148,8 @@ test("routine scheduler uses an exact destination and binds replies to its fresh
     },
   });
   const replacementWorkspace = await mkdtemp(path.join(os.tmpdir(), "pipa-routine-reconfigured-"));
-  await writePrivateJson(paths.config, { ...config, workingDirectory: replacementWorkspace });
+  const modelB = { providerID: "fireworks-ai", modelID: "model-b" };
+  await writePrivateJson(paths.config, { ...config, workingDirectory: replacementWorkspace, defaultModel: modelB });
   now = "2026-08-29T13:00:00.000Z";
   intervalTick();
   await scheduler.drain();
@@ -1156,6 +1158,7 @@ test("routine scheduler uses an exact destination and binds replies to its fresh
   assert.equal(calls.length, 1);
   assert.equal(calls[0].prompt, routine.prompt);
   assert.equal(calls[0].sessionId, null);
+  assert.deepEqual(calls[0].model, { providerID: "openai", modelID: "model-a" });
   assert.equal(calls[0].workingDirectory, home);
   assert.equal(calls[0].contextEnvironment.PIPA_CURRENT_SLACK_CHANNEL_ID, "C123");
   assert.equal(calls[0].contextEnvironment.PIPA_CURRENT_SLACK_THREAD_TS, "");
@@ -1171,6 +1174,7 @@ test("routine scheduler uses an exact destination and binds replies to its fresh
   await waitFor(() => calls.length === 2);
   assert.equal(calls[1].prompt, "How many items?");
   assert.equal(calls[1].sessionId, "ses_routine");
+  assert.deepEqual(calls[1].model, modelB);
   assert.deepEqual(posts, [
     { id: "slack:C123:", payload: { markdown: "finished" } },
     { id: conversationKey, payload: { markdown: "continued" } },
