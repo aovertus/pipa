@@ -59,4 +59,52 @@ Consequently live modal behavior, completed provider/model metadata for A/B, rea
 
 ## Shipping follow-through
 
-Implementation returned to LFG after local checks. Simplification, code review, shipping, and CI outcomes are recorded below as those stages run.
+Simplification completed with no code changes (reuse/quality/efficiency passes inline). No lint or typecheck is configured; the full suite and package smoke are the repository gates.
+
+Code review found one P1 ordering regression at the new pre-enqueue config read. A deterministic regression test failed with `older` delivered instead of `newer`. Model resolution now happens inside the runner callback, preserving enqueue order. The focused app/CLI/model suites and both full checks passed after the fix. Commit: `7e43638` (`fix(review): preserve message order during model resolution`). CLI lifecycle tests now also prove that A and unset-created routines do not adopt live B after an edit.
+
+Review coverage: correctness, scoped project standards, testing, security, reliability, adversarial, API contract, and agent-native passes ran inline. No independent agreement promotion was used. A separate validator was unavailable; the P1 was retained validation-degraded during review and then proved by the red/green regression. No actionable findings or settled-decision conflicts remain.
+
+Browser test result: **PARTIAL**. No local web routes or browser dev server exist in this CLI. The native Slack picker live flow is **Skip** because it requires the distinct test installation described above. No production listener or browser session was started. Native SDK/adapter automated evidence is separate from this skip.
+
+Shipping and CI outcomes are recorded after the PR exists.
+
+### Implementation receipt
+
+```json
+{
+  "status": "complete",
+  "plan_path": "docs/plans/2026-10-20-1258-feat-slack-installation-model-plan.md",
+  "source_kind": "plan",
+  "source_digest": "sha256:a3ce0366fac6c90894b63d9a847eb6f587225c34567553da1a284f40fe3fa1d9",
+  "changed_files": ["src/state.mjs", "src/opencode.mjs", "src/app.mjs", "src/routines.mjs", "src/models.mjs", "bin/pipa.mjs", "test/state.test.mjs", "test/opencode.test.mjs", "test/app.test.mjs", "test/routines.test.mjs", "test/cli.test.mjs", "test/models.test.mjs", "scripts/pack-smoke.mjs", "README.md", "CONTRIBUTING.md", "docs/repository-overview.md", "docs/stu-722-lfg-report.md"],
+  "u_ids_attempted": ["U1", "U2", "U3", "U4"],
+  "u_ids_completed": ["U1", "U2", "U3", "U4"],
+  "verification_results": ["Focused suites: exit 0", "npm test -- --test-reporter=dot: exit 0", "npm run test:pack: exit 0"],
+  "verification_evidence": [
+    {"unit": "U1", "behavior_changed": true, "existing_tests_inspected": ["test/state.test.mjs", "test/opencode.test.mjs"], "tests_added_or_changed": ["test/state.test.mjs", "test/opencode.test.mjs"], "tests_used_unchanged": "Other state/executor cases", "red_observed": "Missing setting export and absent native payload model", "result": "Owning suites exit 0"},
+    {"unit": "U2", "behavior_changed": true, "existing_tests_inspected": ["test/app.test.mjs", "test/routines.test.mjs", "test/cli.test.mjs"], "tests_added_or_changed": ["test/app.test.mjs", "test/routines.test.mjs", "test/cli.test.mjs"], "tests_used_unchanged": "Other app/routine/CLI cases", "red_observed": "Absent dispatch snapshot, preview inheritance, null retention", "result": "Owning suites exit 0"},
+    {"unit": "U3", "behavior_changed": true, "existing_tests_inspected": ["test/app.test.mjs", "test/state.test.mjs", "test/opencode.test.mjs"], "tests_added_or_changed": ["test/models.test.mjs", "test/state.test.mjs", "test/opencode.test.mjs"], "tests_used_unchanged": "Existing permission/question/shutdown cases", "red_observed": "Picker module absent before implementation", "result": "Native adapter, failure matrix, authenticated catalog, timeout suites exit 0"},
+    {"unit": "U4", "behavior_changed": false, "existing_tests_inspected": ["scripts/pack-smoke.mjs"], "tests_added_or_changed": ["scripts/pack-smoke.mjs"], "tests_used_unchanged": "Installed initialization and Managed smoke", "result": "Full suite and pack smoke exit 0", "exception_reason": "Live smoke unavailable without distinct Slack test installation; docs reviewed against implementation"}
+  ],
+  "implementation_engine_binding": null,
+  "requested_route": "native",
+  "actual_route": "native:OpenCode",
+  "requested_model": null,
+  "actual_model": "openai/gpt-6.1-sol",
+  "fallback_reason": null,
+  "run_id": null,
+  "unit_receipts": [
+    {"unit": "U1", "route": "native", "model": "openai/gpt-6.1-sol", "detached_process": null, "integration": "canonical checkout", "verification": "passed", "commit": "8679b5f", "cleanup": "no worker"},
+    {"unit": "U2", "route": "native", "model": "openai/gpt-6.1-sol", "detached_process": null, "integration": "canonical checkout", "verification": "passed", "commit": "4cbc321", "cleanup": "no worker"},
+    {"unit": "U3", "route": "native", "model": "openai/gpt-6.1-sol", "detached_process": null, "integration": "canonical checkout", "verification": "passed", "commit": "467231a", "cleanup": "no worker"},
+    {"unit": "U4", "route": "native", "model": "openai/gpt-6.1-sol", "detached_process": null, "integration": "canonical checkout", "verification": "passed; live gap disclosed", "commit": "fd8181c", "cleanup": "no worker"}
+  ],
+  "plan_checkpoint": null,
+  "blockers": [],
+  "recovery_path": null,
+  "settled_decision_conflicts": [],
+  "behavior_change": true,
+  "standalone_shipping_skipped": true
+}
+```
