@@ -40,7 +40,7 @@ Planning confidence and document review ran inline. Persona passes were performe
 | Unit | Pre-change evidence | Protection and outcome |
 |---|---|---|
 | U1 | Owning state/executor suites inspected; focused run failed on missing persistence export and absent payload model | State save/reload/preservation, queued writes, failed-write recovery, private permissions, native parts/system/model, stale-session replacement and caller-mutation isolation pass |
-| U2 | App/routines/CLI suites inspected; new assertions failed on missing snapshot, inherited preview, and dispatch model | Legacy absent/null, immutable edit snapshot, CLI preview inheritance, routine A versus ordinary followup B in the same session pass |
+| U2 | App/routines/CLI suites inspected; new assertions failed on missing snapshot, inherited preview, and dispatch model | Legacy absent/null, immutable edit snapshot, CLI preview inheritance, routine A versus ordinary follow-up B in the same session pass |
 | U3 | New picker suite failed before module existed | Native installed SDK/adapter command/options/Save/reopen/Cancel and A→B same-session requests pass; denied/foreign/expired contexts, unknown selection, discovery errors, failed writes, option/label bounds, manifest, authenticated catalog and timeout pass |
 | U4 | Non-behavioral docs use code/source review; package smoke extended | Installed picker import, command/scope manifest, inherited routine preview, initialization/cancellation/Managed start pass |
 
@@ -62,7 +62,7 @@ Normalization uses Unicode compatibility decomposition with combining-mark remov
 
 Slack's [manifest reference](https://docs.slack.dev/reference/app-manifest/) specifies a maximum of 32 characters including `/`. The app-management form was inspected without saving and states that commands start with `/`, are lowercase, and contain no spaces. The implementation uses the conservative letter/digit/hyphen subset. Slack's [command guide](https://docs.slack.dev/interactivity/implementing-slash-commands/) confirms that commands are not namespaced and the most recently installed app wins a collision.
 
-The earlier name-only correction had no alias. In this followup, focused tests first failed on absent alias registration/dispatch, missing installation identity, absent manifest export, and absent commands-scope guidance. Native SDK/adapter tests now cover `/chopper` or `/pipa` for Chopper, `/pipwick` or `/pipa` for Pipwick, and the deduplicated `/pipa` for Pipa. They exercise denied users, options/Save/reopen/Cancel and same-session model changes. The state suite preserves naming boundaries; package smoke checks both `/pack-bot` and `/pipa`.
+The earlier name-only correction had no alias. In this follow-up, focused tests first failed on absent alias registration/dispatch, missing installation identity, absent manifest export, and absent commands-scope guidance. Native SDK/adapter tests now cover `/chopper` or `/pipa` for Chopper, `/pipwick` or `/pipa` for Pipwick, and the deduplicated `/pipa` for Pipa. They exercise denied users, options/Save/reopen/Cancel and same-session model changes. The state suite preserves naming boundaries; package smoke checks both `/pack-bot` and `/pipa`.
 
 `pipa manifest` loads the existing config read-only and prints the current local manifest template without tokens. CLI regression tests prove config/defaultModel, sessions, routines, and cached manifest bytes are unchanged; unsupported apply flags are rejected and help works without a configured profile. It does not query/update Slack, acquire an instance lock, or run inference. The README explains merging only desired command/scope additions into an existing remote/custom manifest, reauthorizing the same app, retaining tokens unless Slack rotates them, and restarting the same profile. Rerunning `pipa init` or replacing credentials is not the existing-user upgrade path.
 
@@ -72,7 +72,7 @@ Existing apps must update their Slack command registration to match local `botNa
 
 Earlier name-only correction verification: focused state/model/app tests, full suite and package smoke exited 0 for `0.5.5`; review against `30e0c3e` completed with no actionable findings (`run_id: stu722-command-review`).
 
-Compatibility/upgrade followup verification: `node --test --test-reporter=dot test/state.test.mjs test/models.test.mjs test/cli.test.mjs test/app.test.mjs`, `npm test -- --test-reporter=dot`, and `npm run test:pack` all exited 0, still at `0.5.5`. Package smoke exercises the installed `manifest` command, token-free output, unchanged existing config/model, and both generated commands. Simplification made no further changes. Review against `49b40ae` completed with no actionable findings (`run_id: stu722-upgrade-review`), inline without independent promotion. No lint/typecheck is configured. There are no local web routes, and no new live app registration/upgrade was performed; native automated evidence is separate from the historical smoke. CI on the latest commit is reported through the PR rather than rewriting prior-head results below.
+Compatibility/upgrade follow-up verification: `node --test --test-reporter=dot test/state.test.mjs test/models.test.mjs test/cli.test.mjs test/app.test.mjs`, `npm test -- --test-reporter=dot`, and `npm run test:pack` all exited 0, still at `0.5.5`. Package smoke exercises the installed `manifest` command, token-free output, unchanged existing config/model, and both generated commands. Simplification made no further changes. Review against `49b40ae` completed with no actionable findings (`run_id: stu722-upgrade-review`), inline without independent promotion. No lint/typecheck is configured. There are no local web routes, and no new live app registration/upgrade was performed; native automated evidence is separate from the historical smoke. CI on the latest commit is reported through the PR rather than rewriting prior-head results below.
 
 ## Historical live smoke evidence (before command-name correction)
 
@@ -85,7 +85,7 @@ The initial absence of an isolated profile was resolved using the already authen
 | Step | Requested and completed model metadata | Result |
 |---|---|---|
 | A | `fireworks-ai` / `accounts/fireworks/routers/deepseek-flash-latest` | Native search and Save succeeded; reopen showed saved A; session storage remained empty until the ordinary prompt. Completed response was `MODEL_A_READY`. |
-| B | `openai` / `gpt-6.1-sol` | Native search and Save succeeded. A same-thread human followup completed with B and recalled `COBALT-722` from the A prompt, proving retained history. |
+| B | `openai` / `gpt-6.1-sol` | Native search and Save succeeded. A same-thread human follow-up completed with B and recalled `COBALT-722` from the A prompt, proving retained history. |
 | Cancel | B remained selected | Selecting A then canceling and confirming Leave did not alter saved B. |
 | Test-only restart | B remained selected | Stopped the test-owned listener, started a replacement with the same isolated profile, and reopened the native modal showing `openai / gpt-6.1-sol`. |
 
