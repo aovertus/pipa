@@ -13,10 +13,40 @@ import { createSessionStore, pipaPaths, writePrivateJson } from "../src/state.mj
 
 const startPipa = (options) => startPipaRuntime({ routinesEnabled: false, ...(options.config && !options.paths ? { loadCurrentConfig: async () => options.config } : {}), ...options });
 
-test("invalid command names fail before Slack or OpenCode startup", async () => {
+test("invalid display names still fail before Slack or OpenCode startup", async () => {
   let started = false;
-  await assert.rejects(startPipa({ config: { botName: "!!!" }, checkSlackToken: async () => { started = true; }, startServer: async () => { started = true; } }), /Bot name/u);
+  await assert.rejects(startPipa({ config: { botName: "A".repeat(36) }, checkSlackToken: async () => { started = true; }, startServer: async () => { started = true; } }), /Bot name/u);
   assert.equal(started, false);
+});
+
+for (const botName of ["🤖", "東京"]) test(`legacy ${botName} profile starts without commands grant and omits an unset model`, async (t) => {
+  const paths = pipaPaths(await mkdtemp(path.join(os.tmpdir(), "pipa-legacy-name-")));
+  await writePrivateJson(paths.config, { botName, workingDirectory: "/work", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", allowedSlackUserIds: ["U1"], allowedSlackChannelIds: ["C1"] });
+  const before = await readFile(paths.config, "utf8");
+  const warnings = [];
+  const calls = [];
+  const posts = [];
+  let mention;
+  let commands;
+  let initialized = false;
+  const app = await startPipa({ paths, checkSlackToken: async () => ({ ok: true, grantedScopes: ["channels:read", "assistant:write"] }),
+    warn: (message) => warnings.push(message),
+    executor: { runTurn: async (input) => { calls.push(input); return { text: "Still working.", sessionId: "ses_legacy" }; }, stopAll() {} },
+    chat: { onSlashCommand: (names) => { commands = names; }, onNewMention: (handler) => { mention = handler; }, onSubscribedMessage() {},
+      initialize: async () => { initialized = true; }, shutdown: async () => undefined } });
+  t.after(() => app.shutdown());
+  assert.equal(initialized, true);
+  assert.deepEqual(commands, ["/pipa"]);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /missing.*commands/iu);
+  const thread = { id: "slack:C1:1.0", channel: { isDM: false }, subscribe: async () => undefined,
+    adapter: { addReaction: async () => undefined, removeReaction: async () => undefined }, post: async (payload) => posts.push(payload) };
+  await mention(thread, { id: "1.0", text: "work", author: { userId: "U1" }, raw: {} });
+  await waitFor(() => posts.length === 1);
+  assert.deepEqual(posts, [{ markdown: "Still working." }]);
+  assert.equal(calls.length, 1);
+  assert.equal(Object.hasOwn(calls[0], "model"), false);
+  assert.equal(await readFile(paths.config, "utf8"), before);
 });
 
 test("a delayed model read cannot let an older message supersede a newer one", async () => {

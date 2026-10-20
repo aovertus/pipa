@@ -142,8 +142,7 @@ export function createManifest(botName) {
 export function slackCommandName(botName) {
   const slug = validateBotName(botName).normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase()
     .replace(/[^a-z0-9]+/gu, "-").replace(/^-+|-+$/gu, "").slice(0, 31).replace(/-+$/u, "");
-  if (!slug) throw new Error("Bot name must contain a letter or number that can form an ASCII Slack command.");
-  return `/${slug}`;
+  return slug ? `/${slug}` : "/pipa";
 }
 
 export function slackCommandNames(botName) {

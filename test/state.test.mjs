@@ -11,6 +11,7 @@ test("installation command names are shared with the manifest and fit Slack's li
     ["Pipa", "/pipa"], ["Chopper", "/chopper"], ["Pipwick", "/pipwick"],
     ['  Workshop "Bot"  ', "/workshop-bot"], ["Pipa_Test.2!", "/pipa-test-2"],
     ["Café 🧪", "/cafe"], ["A".repeat(35), `/${"a".repeat(31)}`],
+    ["🤖", "/pipa"], ["東京", "/pipa"], ["!!!", "/pipa"],
     [`${"A".repeat(30)} !bot`, `/${"a".repeat(30)}`],
   ]) {
     assert.equal(slackCommandName(name), command);
@@ -18,7 +19,7 @@ test("installation command names are shared with the manifest and fit Slack's li
     assert.deepEqual(createManifest(name).features.slash_commands.map((entry) => entry.command), command === "/pipa" ? ["/pipa"] : [command, "/pipa"]);
     assert.match(command, /^\/[a-z0-9-]{1,31}$/u);
   }
-  for (const name of ["", "!!!", "🧪", "A".repeat(36), "line\nbreak"]) {
+  for (const name of ["", "A".repeat(36), "line\nbreak"]) {
     assert.throws(() => slackCommandName(name), /Bot name/u);
   }
 });
