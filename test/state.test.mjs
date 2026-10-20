@@ -4,7 +4,29 @@ import { writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { acquireInstanceLock, createManifest, createManifestUrl, createSessionStore, loadConfig, loadSessions, pipaPaths, saveConfig, stopInstance, writePrivateJson } from "../src/state.mjs";
+import { acquireInstanceLock, createManifest, createManifestUrl, createSessionStore, createModelSetting, loadConfig, loadSessions, pipaPaths, saveConfig, stopInstance, writePrivateJson } from "../src/state.mjs";
+
+test("model saves serialize, reload unrelated fields, and recover after failed persistence", async () => {
+  const paths = pipaPaths(await mkdtemp(path.join(os.tmpdir(), "pipa-model-")));
+  const base = { botName: "Pipa", workingDirectory: "/work", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", extra: { preserved: true } };
+  await writePrivateJson(paths.config, base);
+  let fail = true;
+  const setting = createModelSetting(paths.config, async (file, value) => {
+    if (fail) { fail = false; throw new Error("disk failure"); }
+    await writePrivateJson(file, value);
+  });
+  const a = { providerID: "openai", modelID: "model/a" };
+  const b = { providerID: "fireworks-ai", modelID: "accounts/router.b" };
+  await assert.rejects(setting.save(a), /disk failure/u);
+  assert.equal((await loadConfig(paths.config)).defaultModel, undefined);
+  await Promise.all([setting.save(a), setting.save(b)]);
+  assert.deepEqual(await loadConfig(paths.config), { ...base, slackMode: "socket", defaultModel: b });
+  const before = await readFile(paths.config, "utf8");
+  await assert.rejects(setting.save({ providerID: "", modelID: "x" }), /model/u);
+  await assert.rejects(setting.save(a, () => { throw new Error("denied"); }), /denied/u);
+  assert.equal(await readFile(paths.config, "utf8"), before);
+  if (process.platform !== "win32") assert.equal((await stat(paths.config)).mode & 0o777, 0o600);
+});
 
 test("manifest preserves approved capabilities and substitutes the bot name", () => {
   const manifest = createManifest('Workshop "Bot"');

@@ -199,9 +199,11 @@ test("uses native sessions, prompt_async, status, messages, context, and file pa
     workingDirectory: "/work",
     contextEnvironment: { PIPA_MESSAGE_CHANNEL: "slack", PIPA_CURRENT_SLACK_CHANNEL_ID: "C1", PIPA_CURRENT_SLACK_THREAD_TS: "123.456" },
     attachments: [attachment],
+    model: { providerID: "openai", modelID: "gpt-test" },
   });
 
   assert.deepEqual(result, { text: "first\nsecond", sessionId: "ses_1" });
+  assert.deepEqual(promptBody.model, { providerID: "openai", modelID: "gpt-test" });
   assert.deepEqual(promptBody.parts[0], { type: "text", text: prompt });
   assert.deepEqual(promptBody.parts[1], { type: "file", mime: "text/plain", filename: "notes.txt", url: temporaryFile.href });
   assert.match(promptBody.system, /not as shell environment variables/u);

@@ -169,7 +169,36 @@ export async function loadConfig(file = pipaPaths().config) {
       throw new Error(`Invalid Pipa config: ${key} must be a list of non-empty Slack IDs.`);
     }
   }
+  normalizeModel(config.defaultModel);
   return { ...config, slackMode };
+}
+
+export function normalizeModel(value) {
+  if (value == null) return null;
+  if (typeof value !== "object" || Array.isArray(value)
+    || Object.keys(value).some((key) => !["providerID", "modelID"].includes(key))
+    || ![value.providerID, value.modelID].every((id) => typeof id === "string" && id.trim() === id && id.length > 0 && id.length <= 500 && !/[\u0000-\u001f\u007f]/u.test(id))) {
+    throw new Error("Invalid model: expected providerID and modelID.");
+  }
+  return { providerID: value.providerID, modelID: value.modelID };
+}
+
+export function createModelSetting(file = pipaPaths().config, writeJson = writePrivateJson) {
+  let tail = Promise.resolve();
+  return {
+    async save(model, authorize = () => undefined) {
+      const selected = normalizeModel(model);
+      if (!selected) return Promise.reject(new Error("A model selection is required."));
+      const write = tail.then(async () => {
+        const current = await loadConfig(file);
+        await authorize(current);
+        await writeJson(file, { ...current, defaultModel: selected });
+        return selected;
+      });
+      tail = write.catch(() => undefined);
+      return write;
+    },
+  };
 }
 
 export async function saveConfig(config, paths = pipaPaths(), manifest = createManifest(config.botName)) {

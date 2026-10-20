@@ -124,9 +124,10 @@ export function createOpenCodeExecutor(options = {}) {
     }
   }
 
-  async function runTurn({ prompt, sessionId, workingDirectory, contextEnvironment = {}, attachments = [], signal, onSession, onInteraction, onPermissionReplied, onPermissionsReconciled }) {
+  async function runTurn({ prompt, sessionId, model, workingDirectory, contextEnvironment = {}, attachments = [], signal, onSession, onInteraction, onPermissionReplied, onPermissionsReconciled }) {
     if (!prompt?.trim()) throw new Error("A prompt is required.");
     if (stopReason) throw stopReason;
+    const selectedModel = model == null ? null : { providerID: model.providerID, modelID: model.modelID };
     const temporaryDirectory = attachments.length ? await mkdtemp(path.join(os.tmpdir(), "pipa-files-")) : null;
     const slackTurn = contextEnvironment.PIPA_MESSAGE_CHANNEL === "slack";
     const controller = new AbortController();
@@ -198,7 +199,7 @@ export function createOpenCodeExecutor(options = {}) {
         }
         await request(`/session/${encodeURIComponent(selectedSessionId)}/prompt_async`, {
           method: "POST",
-          body: JSON.stringify(promptBody(prompt, files, contextEnvironment, artifactDirectory)),
+          body: JSON.stringify({ ...promptBody(prompt, files, contextEnvironment, artifactDirectory), ...(selectedModel ? { model: selectedModel } : {}) }),
         }, workingDirectory, controller, [204]);
 
         while (true) {
