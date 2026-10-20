@@ -101,9 +101,23 @@ A newly created **Pipa Verify 722** Slack app (`A0CARBULTAM`) accepted the lates
 
 Both completed turns used session `ses_ea632d7a5ffeV7kHAkN0N3bp31`, with two user messages observed after B. These are completed OpenCode response metadata, not model self-identification; Fireworks router metadata does not establish its internal upstream identity. This verifies new-app registration and the local existing-profile export, not applying an upgrade to a pre-existing remote Slack app.
 
-**Cleanup deviation:** The first stop/restart succeeded. At final cleanup, shutdown immediately after closing the reopened modal raced a late Slack acknowledgment: the installed Socket Mode SDK rejected with `slack_socket_mode_no_reply_received_error` after disconnect. The test process exited and left its test lock; the helper's clean-lock assertion failed. Its PID was subsequently confirmed dead before removing that test-owned profile. This shutdown race is an observed unresolved limitation, not a clean-shutdown pass.
+**Historical cleanup deviation (addressed below):** The first stop/restart succeeded. At final cleanup, shutdown immediately after closing the reopened modal raced a late Slack acknowledgment: the installed Socket Mode SDK rejected with `slack_socket_mode_no_reply_received_error` after disconnect. The test process exited and left its test lock; the helper's clean-lock assertion failed. Its PID was subsequently confirmed dead before removing that test-owned profile. That run did not pass final clean shutdown.
 
 The temporary app was deleted (Slack returned `apps?deleted=1`, invalidating its credentials). The test-owned OpenCode session, profile, credentials, and stale lock were removed after confirming the listener was dead. Only non-secret metadata and the Slack conversation remain. Production Pipa and the attached OpenCode server were not restarted or stopped. Final CI status belongs to the resulting report commit and is recorded on the PR separately.
+
+## Shutdown race fix and fresh verification (2026-10-20)
+
+The pinned `@chat-adapter/slack@4.38.1` Socket Mode listener awaits `routeSocketEvent()` in an async EventEmitter callback without observing its rejection. Its `disconnect()` closes the socket without draining event routing. A late interactive acknowledgment therefore reaches `SocketModeClient.send()` after the WebSocket becomes inactive; Node's unhandled rejection terminates the process before the CLI's lock-release `finally` can finish. The lock ownership implementation itself did not require a change.
+
+`createPipaSlackAdapter()` now stops Socket Mode ingress before draining already-accepted routes, with a three-second deadline, then disconnects the transport. It observes routing/acknowledgment failures locally with credential-free diagnostics, including a pending route that rejects after the deadline. There is no process-wide rejection handler or delay-based workaround. Existing cancellation, overall shutdown bounds, and OpenCode ownership remain intact.
+
+The initial deterministic regression failed because disconnect occurred before the held native modal-close acknowledgment; the real Socket Mode client's send then rejected as disconnected. The fix passes that test, deadline/late-rejection coverage, and a test proving the listener is detached before another envelope can enter. Existing native modal tests previously bypassed Socket Mode routing and teardown, so they could not catch this race.
+
+A fresh, distinct **Pipa Shutdown Test** app (`A0CAJJQ8LCV`) was installed with only `/pipa-shutdown-test` (no shared `/pipa` alias), its own tokens, a temporary profile, and channel/user allowlists. The first live drain-only experiment exited and released the lock but logged an event failure: a captured SDK stack showed `sendWhileNotReadyError` from a newly arriving interactive envelope during disconnect. That observation led to the ingress-detach ordering above; a drain alone is insufficient.
+
+On the final implementation, **three consecutive real CLI cycles** opened the native picker, clicked Cancel, and immediately sent SIGTERM to that test-owned process. Each cycle verified exit **0** with no terminating signal, no acknowledgment/unhandled-rejection/drain-timeout diagnostic, and the owned instance lock absent. The same isolated profile was reused between cycles. The live test used [the existing test channel](https://lunchpaillabs.slack.com/archives/C0BNJJ9RDB2); it created no inference sessions. These are fresh shutdown observations, not a rerun of the historical A/B model proof.
+
+Focused app/model tests, full `npm test -- --test-reporter=dot`, and `npm run test:pack` passed. Final-head CI is recorded on PR #41 after push. The temporary app was deleted (`apps?deleted=1`), invalidating its tokens; its processes were confirmed exited and its profile/credentials removed. Production Pipa and the attached OpenCode server were not restarted or stopped. The deferred no-reply stash and unrelated `tmp/` remain preserved. Version remains **0.5.5**.
 
 ## Historical live smoke evidence (before command-name correction)
 
@@ -144,7 +158,7 @@ PR: https://github.com/lunchpaillola/pipa/pull/41 . The pipeline snapshot for he
   "plan_path": "docs/plans/2026-10-20-1258-feat-slack-installation-model-plan.md",
   "source_kind": "plan",
   "source_digest": "sha256:a3ce0366fac6c90894b63d9a847eb6f587225c34567553da1a284f40fe3fa1d9",
-  "changed_files": ["src/state.mjs", "src/opencode.mjs", "src/app.mjs", "src/routines.mjs", "src/models.mjs", "bin/pipa.mjs", "test/state.test.mjs", "test/opencode.test.mjs", "test/app.test.mjs", "test/routines.test.mjs", "test/cli.test.mjs", "test/models.test.mjs", "scripts/pack-smoke.mjs", "README.md", "CONTRIBUTING.md", "docs/repository-overview.md", "docs/stu-722-lfg-report.md"],
+  "changed_files": ["src/state.mjs", "src/opencode.mjs", "src/app.mjs", "src/routines.mjs", "src/models.mjs", "bin/pipa.mjs", "test/state.test.mjs", "test/opencode.test.mjs", "test/app.test.mjs", "test/routines.test.mjs", "test/cli.test.mjs", "test/models.test.mjs", "scripts/pack-smoke.mjs", "package.json", "package-lock.json", "README.md", "CONTRIBUTING.md", "docs/repository-overview.md", "docs/stu-722-lfg-report.md"],
   "u_ids_attempted": ["U1", "U2", "U3", "U4"],
   "u_ids_completed": ["U1", "U2", "U3", "U4"],
   "verification_results": ["Focused suites: exit 0", "npm test -- --test-reporter=dot: exit 0", "npm run test:pack: exit 0"],

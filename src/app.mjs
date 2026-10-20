@@ -47,7 +47,7 @@ export async function startPipa(options = {}) {
   const state = options.state ?? createMemoryState();
   const chat = options.chat ?? new Chat({
     adapters: {
-      slack: createSlackAdapter({
+      slack: createPipaSlackAdapter({
         appToken: config.slackAppToken,
         botToken: config.slackBotToken,
         mode: "socket",
@@ -294,6 +294,43 @@ export async function startPipa(options = {}) {
       }
     },
   };
+}
+
+export function createPipaSlackAdapter(options, drainTimeoutMs = 3_000) {
+  const adapter = createSlackAdapter(options);
+  const route = adapter.routeSocketEvent.bind(adapter);
+  const disconnect = adapter.disconnect.bind(adapter);
+  const pending = new Set();
+  let disconnecting;
+  // The pinned adapter's async EventEmitter listener neither observes route
+  // rejections nor drains acknowledgments before closing its Socket Mode client.
+  adapter.routeSocketEvent = (...args) => {
+    if (disconnecting) return Promise.resolve();
+    const task = (async () => {
+      try {
+        await route(...args);
+      } catch {
+        // SDK errors can contain payloads/tokens; keep diagnostics credential-free.
+        adapter.logger.error("Pipa Slack Socket Mode event failed.");
+      }
+    })();
+    pending.add(task);
+    void task.then(() => pending.delete(task));
+    return task;
+  };
+  adapter.disconnect = () => disconnecting ??= (async () => {
+    // Stop ingress before draining; otherwise a new envelope can arrive while
+    // SocketModeClient.disconnect() is closing the WebSocket and fail its ack.
+    adapter.socketClient?.removeAllListeners("slack_event");
+    try {
+      await withTimeout(Promise.all([...pending]), drainTimeoutMs, "Slack acknowledgment drain timed out.");
+    } catch {
+      adapter.logger.error("Pipa Slack acknowledgment drain timed out.");
+    } finally {
+      await disconnect();
+    }
+  })();
+  return adapter;
 }
 
 export function createPendingInteractions(allowedUserIds = []) {

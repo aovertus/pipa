@@ -4,9 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createSlackAdapter } from "@chat-adapter/slack";
+import { SocketModeClient } from "@slack/socket-mode";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { Chat } from "chat";
-import { checkSlackAppToken, checkSlackToken, createConversationRunner, createPendingInteractions, initializePipa, postResult, slackDestinationId, startPipa as startPipaRuntime } from "../src/app.mjs";
+import { checkSlackAppToken, checkSlackToken, createConversationRunner, createPendingInteractions, createPipaSlackAdapter, initializePipa, postResult, slackDestinationId, startPipa as startPipaRuntime } from "../src/app.mjs";
 import { PipaRestartingError, PipaStoppedError } from "../src/opencode.mjs";
 import { createRoutineScheduler, normalizeRoutine } from "../src/routines.mjs";
 import { createSessionStore, pipaPaths, writePrivateJson } from "../src/state.mjs";
@@ -1116,6 +1117,71 @@ for (const allowedSlackUserIds of [["U1"], []]) test(`handles only allowed Slack
   await waitFor(() => posts.length === 2);
   assert.deepEqual(calls, ["alert fired", "triage this"]);
   assert.deepEqual(posts, [{ markdown: "alert fired" }, { markdown: "triage this" }]);
+});
+
+test("Socket shutdown drains a modal-close acknowledgment before disconnecting", async (t) => {
+  const adapter = createPipaSlackAdapter({ mode: "socket", appToken: "xapp-test", botToken: "xoxb-test", botUserId: "UPIPA" });
+  const socket = new SocketModeClient({ appToken: "xapp-test", logLevel: "error" });
+  const events = [];
+  socket.websocket = { isActive: () => true, send: (_data, callback) => { events.push("ack"); callback(); } };
+  socket.disconnect = async () => { events.push("disconnect"); socket.websocket = undefined; };
+  adapter.socketClient = socket;
+  const chat = new Chat({ adapters: { slack: adapter }, state: createMemoryState(), logger: "silent" });
+  adapter.chat = chat;
+  const release = Promise.withResolvers();
+  const entered = Promise.withResolvers();
+  const routing = adapter.routeSocketEvent({ type: "view_closed", user: { id: "U1" }, view: { id: "V1", callback_id: "pipa_model" } }, "interactive", async () => {
+    entered.resolve();
+    await release.promise;
+    await socket.send("close-envelope");
+  });
+  void routing.catch(() => undefined);
+  await entered.promise;
+  const closing = adapter.disconnect();
+  t.after(async () => { release.resolve(); await Promise.allSettled([routing, closing]); });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, [], "disconnect must wait for the accepted envelope acknowledgment");
+  release.resolve();
+  await Promise.all([routing, closing]);
+  assert.deepEqual(events, ["ack", "disconnect"]);
+});
+
+test("Socket shutdown bounds the drain and observes late and normal acknowledgment failures", async () => {
+  const adapter = createPipaSlackAdapter({ mode: "socket", appToken: "xapp-test", botToken: "xoxb-test", botUserId: "UPIPA" }, 5);
+  const errors = [];
+  adapter.logger.error = (message) => errors.push(message);
+  const release = Promise.withResolvers();
+  let disconnected = false;
+  adapter.socketClient = { removeAllListeners() {}, disconnect: async () => { disconnected = true; } };
+  const failure = new Error("private xapp-test payload");
+  failure.code = "slack_socket_mode_no_reply_received_error";
+  await assert.doesNotReject(adapter.routeSocketEvent({}, "events_api", async () => { throw failure; }));
+  const late = adapter.routeSocketEvent({}, "events_api", async () => { await release.promise; throw failure; });
+  await adapter.disconnect();
+  assert.equal(disconnected, true, "a stuck acknowledgment cannot prevent transport cleanup");
+  release.resolve();
+  await assert.doesNotReject(late);
+  assert.deepEqual(errors, ["Pipa Slack Socket Mode event failed.", "Pipa Slack acknowledgment drain timed out.", "Pipa Slack Socket Mode event failed."]);
+});
+
+test("Socket drain stops ingress before accepting a late modal-close envelope", async () => {
+  const adapter = createPipaSlackAdapter({ mode: "socket", appToken: "xapp-test", botToken: "xoxb-test", botUserId: "UPIPA" });
+  const socket = new SocketModeClient({ appToken: "xapp-test", logLevel: "error" });
+  const release = Promise.withResolvers();
+  socket.disconnect = async () => undefined;
+  adapter.socketClient = socket;
+  socket.on("slack_event", ({ body, type, ack }) => adapter.routeSocketEvent(body, type, ack));
+  const routing = adapter.routeSocketEvent({}, "unknown", () => release.promise);
+  const closing = adapter.disconnect();
+  let acknowledgments = 0;
+  // A throwing body getter proves the original router never inspects this event.
+  const body = { get type() { assert.fail("new work must not be dispatched during drain"); } };
+  socket.emit("slack_event", { body, type: "interactive", ack: async () => { acknowledgments++; } });
+  assert.equal(socket.listenerCount("slack_event"), 0);
+  await adapter.routeSocketEvent(body, "interactive", async () => { acknowledgments++; });
+  assert.equal(acknowledgments, 0, "closing connections must not accept new envelopes");
+  release.resolve();
+  await Promise.all([routing, closing]);
 });
 
 test("Slack SDK routes allowlisted webhook mentions and subscribed bot replies to Pipa", async (t) => {
