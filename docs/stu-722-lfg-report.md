@@ -82,6 +82,29 @@ State tests cover `🤖`, `東京`, and punctuation-only names. New app regressi
 
 Fallback verification: the focused state/app suites, full `npm test -- --test-reporter=dot`, and `npm run test:pack` exited 0 at `0.5.5`. The scoped review against `e54899e` completed with no actionable findings (`run_id: stu722-fallback-review`); it ran inline without independent promotion. The production fix is one return expression, so no simplification refactor was warranted.
 
+## Fresh verification on `a1214a3` (named command and alias)
+
+The focused state/executor/model/app/routine/CLI suites, `npm test -- --test-reporter=dot`, and `npm run test:pack` were rerun successfully against `a1214a36271efaefa8eb77c9654312308efeebec`, version **0.5.5**. The final evidence commit changes this report only.
+
+A newly created **Pipa Verify 722** Slack app (`A0CARBULTAM`) accepted the latest generated manifest with `/pipa-verify-722`, `/pipa`, `commands`, and Socket Mode. Its own tokens, temporary workspace/profile, and listener were used. The existing OpenCode server was attached and remained unowned. A refreshed Slack client showed no `/pipa` registration before installation; production app settings were not changed.
+
+`pipa manifest` emitted token-free JSON containing both commands. A before/after snapshot proved all existing profile files byte-for-byte unchanged. Selecting A through `/pipa-verify-722 model` saved the setting while session storage remained empty. Opening `/pipa model` identified the same test installation and showed saved A.
+
+[Fresh test conversation](https://lunchpaillabs.slack.com/archives/C0BNJJ9RDB2/p1792507979403449)
+
+| Step | Completed response metadata / observation | Result |
+|---|---|---|
+| Named command / A | `fireworks-ai` / `accounts/fireworks/routers/deepseek-flash-latest`; assistant `msg_159cd2897001d2Wo9sZ95PR05b` | Native search and Save; completed reply `FRESH_A_READY` |
+| Compatibility alias / B | `openai` / `gpt-6.1-sol`; assistant `msg_159cdf7f3001tPSbihEuN5AGTX` | Native search and Save; same-thread follow-up recalled `AMBER-722` |
+| Reopen and Cancel | Reopen showed B; select A, Cancel, then confirm Leave | Saved B remained unchanged |
+| Test-profile restart | A replacement test listener loaded B and the existing session mapping; `/pipa model` reopened showing `gpt-6.1-sol` | Persistence passed |
+
+Both completed turns used session `ses_ea632d7a5ffeV7kHAkN0N3bp31`, with two user messages observed after B. These are completed OpenCode response metadata, not model self-identification; Fireworks router metadata does not establish its internal upstream identity. This verifies new-app registration and the local existing-profile export, not applying an upgrade to a pre-existing remote Slack app.
+
+**Cleanup deviation:** The first stop/restart succeeded. At final cleanup, shutdown immediately after closing the reopened modal raced a late Slack acknowledgment: the installed Socket Mode SDK rejected with `slack_socket_mode_no_reply_received_error` after disconnect. The test process exited and left its test lock; the helper's clean-lock assertion failed. Its PID was subsequently confirmed dead before removing that test-owned profile. This shutdown race is an observed unresolved limitation, not a clean-shutdown pass.
+
+The temporary app was deleted (Slack returned `apps?deleted=1`, invalidating its credentials). The test-owned OpenCode session, profile, credentials, and stale lock were removed after confirming the listener was dead. Only non-secret metadata and the Slack conversation remain. Production Pipa and the attached OpenCode server were not restarted or stopped. Final CI status belongs to the resulting report commit and is recorded on the PR separately.
+
 ## Historical live smoke evidence (before command-name correction)
 
 This smoke used the then-universal `/pipa` command. It remains evidence for model selection/history/Cancel/restart semantics, but does not prove live custom-command registration in the revised implementation. The custom commands are covered by the native automated adapter tests described above.
