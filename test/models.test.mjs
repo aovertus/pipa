@@ -11,6 +11,103 @@ import { startPipa } from "../src/app.mjs";
 import { createModelPicker } from "../src/models.mjs";
 import { createModelSetting, createSessionStore, loadConfig, pipaPaths, writePrivateJson } from "../src/state.mjs";
 
+for (const shutdown of [false, true]) test(`Save acknowledges before slow work; ${shutdown ? "shutdown prevents stale writes and delivery" : "confirmation follows persistence"}`, async () => {
+  const handlers = {};
+  const gate = Promise.withResolvers();
+  const writeGate = Promise.withResolvers();
+  const writeStarted = Promise.withResolvers();
+  let view;
+  let loadingSave = false;
+  let writes = 0;
+  const notices = [];
+  const adapter = { webClient: { views: {
+    open: async () => ({ view: { id: "V1" } }),
+    update: async (input) => { view = input.view; },
+  } }, postEphemeral: async (...args) => notices.push(args) };
+  const picker = createModelPicker({ botName: "Chopper", commands: ["/chopper"], loadConfig: async () => ({}),
+    chat: { onSlashCommand: (_id, fn) => { handlers.open = fn; }, onModalSubmit: (_id, fn) => { handlers.save = fn; } },
+    listModels: async () => { if (loadingSave) await gate.promise; return [{ providerID: "openai", modelID: "a", name: "Model A" }]; },
+    setting: { save: async (_model, authorize) => { authorize({}); writes++; writeStarted.resolve(); await writeGate.promise; } } });
+  await handlers.open({ text: "model", user: { userId: "U1" }, triggerId: "trigger", adapter,
+    channel: { id: "slack:C1", postEphemeral: async () => undefined } });
+  const input = view.blocks[0].element;
+  loadingSave = true;
+  const submission = { user: { userId: "U1" }, viewId: "V1", adapter,
+    privateMetadata: JSON.parse(view.private_metadata).m, values: { [input.action_id]: input.option_groups[0].options[0].value } };
+  const saving = handlers.save(submission);
+  try {
+    assert.deepEqual(await Promise.race([saving, delay(100).then(() => null)]), { action: "close" });
+    assert.equal(writes, 0);
+    assert.equal(notices.length, 0);
+    assert.deepEqual(await handlers.save(submission), { action: "close" }, "duplicate Save does not enqueue another write");
+  } finally {
+    if (shutdown) picker.close();
+    gate.resolve();
+    await saving;
+    if (!shutdown) {
+      await writeStarted.promise;
+      assert.equal(notices.length, 0, "no confirmation while persistence is still pending");
+    }
+    writeGate.resolve();
+    await picker.drain?.();
+    picker.close();
+  }
+  assert.equal(writes, shutdown ? 0 : 1);
+  assert.equal(notices.length, shutdown ? 0 : 1);
+  if (!shutdown) assert.equal(notices[0][2], "Switched to Model A for all chats.");
+});
+
+for (const cancel of [false, true]) test(`opens before slow discovery and ${cancel ? "does not refill a cancelled window" : "populates the window afterward"}`, async () => {
+  const handlers = {};
+  const started = Promise.withResolvers();
+  const gate = Promise.withResolvers();
+  let loading;
+  const updates = [];
+  const picker = createModelPicker({ botName: "Chopper", commands: ["/chopper"], loadConfig: async () => ({}), setting: {},
+    chat: { onSlashCommand: (_id, fn) => { handlers.open = fn; }, onModalClose: (_id, fn) => { handlers.close = fn; } },
+    listModels: async () => { started.resolve(Boolean(loading)); await gate.promise; return [{ providerID: "openai", modelID: "a" }]; } });
+  const opening = handlers.open({ text: "model", user: { userId: "U1" }, channel: { id: "slack:C1", postEphemeral: async () => undefined },
+    adapter: { webClient: { views: {
+      open: async ({ view }) => { loading = view; return { view: { id: "V1" } }; },
+      update: async ({ view }) => updates.push(view),
+    } } } });
+  try {
+    assert.equal(await started.promise, true, "catalog discovery starts only after the trigger has opened a window");
+    assert.equal(loading.submit, undefined);
+    if (cancel) handlers.close({ user: { userId: "U1" }, privateMetadata: JSON.parse(loading.private_metadata).m });
+  } finally {
+    gate.resolve();
+    await opening;
+    picker.close();
+  }
+  assert.equal(updates.length, cancel ? 0 : 1);
+  if (!cancel) assert.equal(updates[0].blocks[0].element.option_groups[0].options.length, 1);
+});
+
+test("Cancel during the post-discovery config read suppresses the populated view update", async () => {
+  const handlers = {};
+  const started = Promise.withResolvers();
+  const gate = Promise.withResolvers();
+  let reads = 0;
+  let loading;
+  let updates = 0;
+  const picker = createModelPicker({ botName: "Chopper", commands: ["/chopper"], setting: {},
+    chat: { onSlashCommand: (_id, fn) => { handlers.open = fn; }, onModalClose: (_id, fn) => { handlers.close = fn; } },
+    loadConfig: async () => { if (++reads === 2) { started.resolve(); await gate.promise; } return {}; },
+    listModels: async () => [{ providerID: "openai", modelID: "a" }] });
+  const opening = handlers.open({ text: "model", user: { userId: "U1" }, channel: { id: "slack:C1", postEphemeral: async () => undefined },
+    adapter: { webClient: { views: {
+      open: async ({ view }) => { loading = view; return { view: { id: "V1" } }; },
+      update: async () => { updates++; },
+    } } } });
+  await started.promise;
+  handlers.close({ user: { userId: "U1" }, privateMetadata: JSON.parse(loading.private_metadata).m });
+  gate.resolve();
+  await opening;
+  picker.close();
+  assert.equal(updates, 0);
+});
+
 for (const [botName, command] of [["Chopper", "/chopper"], ["Chopper", "/pipa"], ["Pipwick", "/pipwick"], ["Pipwick", "/pipa"], ["Pipa", "/pipa"]]) test(`native Slack adapter routes ${command} to ${botName} with options, Save, Cancel and same-session requests`, async (t) => {
   const paths = pipaPaths(await mkdtemp(path.join(os.tmpdir(), "pipa-native-model-")));
   const config = { botName, workingDirectory: "/work", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", allowedSlackUserIds: ["U1"], allowedSlackChannelIds: ["C1"] };
@@ -20,7 +117,14 @@ for (const [botName, command] of [["Chopper", "/chopper"], ["Chopper", "/pipa"],
   const views = [];
   const notices = [];
   adapter.postEphemeral = async (...args) => { notices.push(args); return { id: "private" }; };
-  adapter._client.views.open = async ({ view }) => { views.push(view); return { ok: true, view: { id: `V${views.length}` } }; };
+  adapter.webClient.views.open = async ({ trigger_id, view }) => {
+    assert.equal(trigger_id, "trigger");
+    assert.equal(view.submit, undefined, "loading window cannot be submitted");
+    assert.match(view.blocks[0].text.text, /Loading/u);
+    views.push(view);
+    return { ok: true, view: { id: `V${views.length}` } };
+  };
+  adapter.webClient.views.update = async ({ view_id, view }) => { views[Number(view_id.slice(1)) - 1] = view; return { ok: true, view: { id: view_id } }; };
   const posts = [];
   adapter.postMessage = async (threadId, text) => { posts.push(text); return { id: "reply", threadId, raw: {} }; };
   adapter.addReaction = adapter.removeReaction = adapter.startTyping = async () => undefined;
@@ -51,14 +155,15 @@ for (const [botName, command] of [["Chopper", "/chopper"], ["Chopper", "/pipa"],
     const view = await open();
     assert.equal(view.blocks[0].type, "input");
     assert.ok(view.blocks[0].label.text.includes(botName));
+    assert.equal(view.blocks[0].element.type, "static_select");
+    const choices = view.blocks[0].element.option_groups.flatMap((group) => group.options);
+    assert.equal(choices.length, models.length, "choices are embedded before any search callback");
     const actionId = view.blocks[0].element.action_id;
-    const optionsResponse = await adapter.handleBlockSuggestion({ action_id: actionId, value: expected.providerID, user: { id: "U1" }, view: { id: `V${views.length}` } });
-    const choices = (await optionsResponse.json()).options;
-    assert.equal(choices.length, 1);
-    const saved = await adapter.handleViewSubmission({ user: { id: "U1" }, view: { ...view, id: `V${views.length}`, state: { values: { [actionId]: { [actionId]: { selected_option: choices[0] } } } } } });
-    const savedView = await saved.json();
-    assert.equal(savedView.response_action, "update");
-    assert.ok(JSON.stringify(savedView.view.blocks).includes(`${botName}:`));
+    const noticeCount = notices.length;
+    const saved = await adapter.handleViewSubmission({ user: { id: "U1" }, view: { ...view, id: `V${views.length}`, state: { values: { [actionId]: { [actionId]: { selected_option: choices[index] } } } } } });
+    assert.deepEqual(await saved.json(), {}, "Save acknowledges by closing without waiting for persistence");
+    for (let tries = 0; notices.length === noticeCount && tries < 100; tries++) await delay(10);
+    assert.equal(notices.at(-1)[2], `Switched to ${expected.name} for all chats.`);
     assert.deepEqual((await loadConfig(paths.config)).defaultModel, { providerID: expected.providerID, modelID: expected.modelID });
     const waiting = [];
     const message = adapter.parseMessage({ type: "message", channel: "C1", ts: `${index + 1}.0`, ...(index ? { thread_ts: "1.0" } : {}), text: index ? "follow up" : "<@UPIPA> begin", user: "U1" });
@@ -70,16 +175,20 @@ for (const [botName, command] of [["Chopper", "/chopper"], ["Chopper", "/pipa"],
   assert.equal(calls[1].sessionId, "ses_same");
   assert.equal(posts.length, 2);
   const reopened = await open();
-  assert.equal(reopened.blocks[0].element.initial_option.text.text, "b");
+  assert.equal(reopened.blocks[0].element.initial_option.text.text, "B");
   const before = await readFile(paths.config, "utf8");
   const waiting = [];
   adapter.handleViewClosed({ user: { id: "U1" }, view: { ...reopened, id: `V${views.length}` } }, { waitUntil: (p) => waiting.push(p) });
   await Promise.all(waiting);
+  const cancelledInput = reopened.blocks[0].element;
+  const cancelledSave = await adapter.handleViewSubmission({ user: { id: "U1" }, view: { ...reopened, id: `V${views.length}`,
+    state: { values: { [cancelledInput.action_id]: { [cancelledInput.action_id]: { selected_option: cancelledInput.initial_option } } } } } });
+  assert.equal((await cancelledSave.json()).response_action, "errors", "Cancel invalidates the picker context");
   assert.equal(await readFile(paths.config, "utf8"), before);
   assert.equal(calls.length, 2);
 });
 
-test("private picker opens/searches/saves/reopens/cancels without inference and rechecks auth", async () => {
+test("private picker preloads/saves/reopens/cancels without inference and rechecks auth", async () => {
   const paths = pipaPaths(await mkdtemp(path.join(os.tmpdir(), "pipa-picker-")));
   const config = { botName: "Pipa", workingDirectory: "/work", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", allowedSlackUserIds: ["U1"], allowedSlackChannelIds: ["C1"] };
   await writePrivateJson(paths.config, config);
@@ -87,7 +196,6 @@ test("private picker opens/searches/saves/reopens/cancels without inference and 
   const handlers = {};
   const chat = {
     onSlashCommand(id, fn) { handlers.slash = fn; },
-    onOptionsLoad(fn) { handlers.options = fn; },
     onModalSubmit(id, fn) { handlers.submit = fn; },
     onModalClose(id, fn) { handlers.close = fn; },
   };
@@ -96,34 +204,41 @@ test("private picker opens/searches/saves/reopens/cancels without inference and 
   const picker = createModelPicker({ chat, botName: "Pipa", commands: ["/pipa"], loadConfig: () => loadConfig(paths.config), setting: createModelSetting(paths.config), listModels: async () => { discoveries++; return models; } });
   const user = { userId: "U1" };
   const messages = [];
-  const opening = { user, text: "model", channel: { id: "slack:C1", postEphemeral: async (...args) => messages.push(args) }, openModal: async (value) => { modal = value; return { viewId: "V1" }; } };
+  const opening = { user, text: "model", triggerId: "trigger", channel: { id: "slack:C1", postEphemeral: async (...args) => messages.push(args) },
+    adapter: { webClient: { views: {
+      open: async ({ view }) => { modal = view; return { view: { id: "V1" } }; },
+      update: async ({ view }) => { modal = view; return { view: { id: "V1" } }; },
+    } }, postEphemeral: async (...args) => messages.push(args) } };
   await handlers.slash(opening);
-  assert.equal(discoveries, 0);
-  const input = modal.children[0];
-  assert.equal(input.placeholder, "OpenCode default");
-  const options = await handlers.options({ actionId: input.id, user, query: "a.b", raw: { view: { id: "V1" } } });
+  assert.equal(discoveries, 1);
+  const input = modal.blocks[0].element;
+  assert.equal(input.placeholder.text, "Browse models or type to filter");
+  const options = input.option_groups.flatMap((group) => group.options);
   assert.equal(options.length, 1);
-  const submission = { user, privateMetadata: modal.privateMetadata, viewId: "V1", values: { [input.id]: options[0].value } };
+  assert.equal(options[0].text.text, "Model A");
+  const submission = { user, adapter: opening.adapter, privateMetadata: JSON.parse(modal.private_metadata).m, viewId: "V1", values: { [input.action_id]: options[0].value } };
   const saved = await handlers.submit(submission);
-  assert.equal(saved.action, "update");
+  assert.equal(saved.action, "close");
+  await picker.drain();
+  assert.equal(messages.at(-1)[2], "Switched to Model A for all chats.");
   assert.deepEqual((await loadConfig(paths.config)).defaultModel, { providerID: "openai", modelID: "model/a.b" });
   await handlers.slash(opening);
-  assert.equal(modal.children[0].initialOption.value, options[0].value);
+  assert.equal(modal.blocks[0].element.initial_option.value, options[0].value);
+  assert.equal(modal.blocks[0].element.initial_option.text.text, "Model A");
   const before = await readFile(paths.config, "utf8");
-  await handlers.close({ privateMetadata: modal.privateMetadata, user, viewId: "V1" });
+  await handlers.close({ privateMetadata: JSON.parse(modal.private_metadata).m, user, viewId: "V1" });
   assert.equal(await readFile(paths.config, "utf8"), before);
   await handlers.slash(opening);
   await writePrivateJson(paths.config, { ...config, allowedSlackUserIds: ["U2"] });
-  assert.deepEqual(await handlers.options({ actionId: modal.children[0].id, user, raw: { view: { id: "V1" } } }), []);
-  const denied = await handlers.submit({ ...submission, privateMetadata: modal.privateMetadata });
+  const denied = await handlers.submit({ ...submission, privateMetadata: JSON.parse(modal.private_metadata).m });
   assert.equal(denied.action, "errors");
   assert.equal((await loadConfig(paths.config)).defaultModel, undefined);
   picker.close();
 });
 
-test("picker failure paths never persist and search output respects Slack bounds", async () => {
+test("picker failure paths never persist and preloaded groups respect Slack bounds without truncating models", async () => {
   const handlers = {};
-  const chat = { onSlashCommand: (_id, fn) => { handlers.open = fn; }, onOptionsLoad: (fn) => { handlers.search = fn; }, onModalSubmit: (_id, fn) => { handlers.save = fn; }, onModalClose: (_id, fn) => { handlers.cancel = fn; } };
+  const chat = { onSlashCommand: (_id, fn) => { handlers.open = fn; }, onModalSubmit: (_id, fn) => { handlers.save = fn; }, onModalClose: (_id, fn) => { handlers.cancel = fn; } };
   const config = { botName: "Pipa Test!", allowedSlackUserIds: ["U1"], allowedSlackChannelIds: ["C1"] };
   const models = Array.from({ length: 120 }, (_, id) => ({ providerID: "provider", modelID: String(id), name: "n".repeat(200) }));
   let clock = 0;
@@ -135,39 +250,128 @@ test("picker failure paths never persist and search output respects Slack bounds
   let modal;
   const user = { userId: "U1" };
   const privateReplies = [];
-  const event = { user, text: "model", channel: { id: "slack:C1", postEphemeral: async (...args) => privateReplies.push(args) }, openModal: async (value) => { modal = value; return { viewId: "V1" }; } };
+  const saveResults = [];
+  const event = { user, text: "model", triggerId: "trigger", channel: { id: "slack:C1", postEphemeral: async (...args) => privateReplies.push(args) },
+    adapter: { webClient: { views: {
+      open: async ({ view }) => { modal = view; return { view: { id: "V1" } }; },
+      update: async ({ view }) => { modal = view; return { view: { id: "V1" } }; },
+    } }, postEphemeral: async (_channel, _user, text) => saveResults.push(text) } };
   for (const text of ["", "unknown"]) await handlers.open({ ...event, text });
   assert.equal(privateReplies.length, 2);
   assert.ok(privateReplies.every((args) => args[1].includes("/pipa-test model") && !args[1].includes("/pipa model")));
   assert.ok(privateReplies.every((args) => args[2].fallbackToDM === false));
   await handlers.open(event);
-  const id = modal.children[0].id;
-  const search = { user, actionId: id, query: "", raw: { view: { id: "V1" } } };
-  const choices = await handlers.search(search);
-  assert.equal(choices.length, 100);
-  assert.ok(choices.every((choice) => choice.label.length <= 75 && choice.value.length <= 150 && choice.description.length <= 75));
-  const save = { user, viewId: "V1", privateMetadata: modal.privateMetadata, values: { [id]: choices[0].value } };
-  for (const bad of [{ ...save, user: { userId: "U2" } }, { ...save, viewId: "other" }, { ...save, privateMetadata: "forged" }, { ...save, values: { [id]: "missing" } }]) {
+  const id = modal.blocks[0].element.action_id;
+  const groups = modal.blocks[0].element.option_groups;
+  const choices = groups.flatMap((group) => group.options);
+  assert.deepEqual(groups.map((group) => group.options.length), [100, 20]);
+  assert.equal(choices.length, 120);
+  assert.ok(choices.every((choice) => choice.text.text.length <= 75 && choice.value.length <= 150 && choice.description.text.length <= 75));
+  const submission = () => {
+    const input = modal.blocks[0].element;
+    return { user, adapter: event.adapter, viewId: "V1", privateMetadata: JSON.parse(modal.private_metadata).m,
+      values: { [input.action_id]: input.option_groups.flatMap((group) => group.options).at(-1).value } };
+  };
+  let save = submission();
+  for (const bad of [{ ...save, user: { userId: "U2" } }, { ...save, viewId: "other" }, { ...save, privateMetadata: "forged" }]) {
     assert.equal((await handlers.save(bad)).action, "errors");
   }
   assert.equal(writes, 0);
+  assert.equal((await handlers.save({ ...save, values: { [id]: "missing" } })).action, "close");
+  await picker.drain();
+  assert.match(saveResults.at(-1), /no longer available/u);
+  assert.equal(writes, 0);
   failed = true;
-  assert.deepEqual(await handlers.search(search), []);
+  await handlers.open(event);
+  assert.equal(modal.submit, undefined, "catalog failure never offers an empty picker for submission");
+  assert.match(modal.blocks[0].text.text, /couldn't load the available models from OpenCode/u);
   assert.equal((await handlers.save(save)).action, "errors");
   assert.equal(writes, 0);
   failed = false;
+  await handlers.open(event);
+  save = submission();
+  const removed = models.pop();
+  assert.equal((await handlers.save(save)).action, "close");
+  await picker.drain();
+  assert.match(saveResults.at(-1), /no longer available/u, "Save rechecks models removed since opening");
+  assert.equal(writes, 0);
+  models.push(removed);
+  await handlers.open(event);
+  save = submission();
   const failedWrite = await handlers.save(save);
-  assert.equal(failedWrite.action, "errors");
-  assert.match(Object.values(failedWrite.errors)[0], /reopen \/pipa-test model/u);
+  assert.equal(failedWrite.action, "close");
+  await picker.drain();
+  assert.match(saveResults.at(-1), /couldn't save.*Reopen \/pipa-test model/u);
   assert.equal(writes, 1);
+  await handlers.open(event);
+  save = submission();
   config.allowedSlackChannelIds = ["C2"];
-  assert.deepEqual(await handlers.search(search), []);
   assert.equal((await handlers.save(save)).action, "errors");
   assert.equal(writes, 1);
   config.allowedSlackChannelIds = ["C1"];
   clock = 31 * 60_000;
   assert.equal((await handlers.save(save)).action, "errors");
   assert.equal(writes, 1);
+  const beforeClose = modal;
   picker.close();
-  assert.deepEqual(await handlers.search(search), []);
+  await handlers.open(event);
+  assert.equal(modal, beforeClose);
+});
+
+for (const count of [0, 10_001]) test(`catalog with ${count} models gives a private explanation instead of an empty or invalid modal`, async () => {
+  let open;
+  let opened = false;
+  const replies = [];
+  let notice;
+  const picker = createModelPicker({
+    chat: { onSlashCommand: (_id, fn) => { open = fn; } }, botName: "Pipa", commands: ["/pipa"],
+    loadConfig: async () => ({}), setting: {},
+    listModels: async () => Array.from({ length: count }, (_, id) => ({ providerID: "provider", modelID: String(id) })),
+  });
+  await open({ user: { userId: "U1" }, text: "model", triggerId: "trigger",
+    channel: { id: "slack:C1", postEphemeral: async (...args) => replies.push(args) },
+    adapter: { webClient: { views: {
+      open: async () => { opened = true; return { view: { id: "V1" } }; },
+      update: async ({ view }) => { notice = view; },
+    } } } });
+  assert.equal(opened, true, "trigger is exchanged before catalog discovery");
+  assert.equal(replies.length, 0);
+  assert.equal(notice.submit, undefined);
+  assert.match(notice.blocks[0].text.text, count ? /exceeds Slack's list limit/u : /No configured models/u);
+  picker.close();
+});
+
+for (const [failure, expected] of [
+  ["configuration", /couldn't read.*saved settings/u],
+  ["access", /isn't enabled for this account or channel/u],
+  ["models", /couldn't load the available models from OpenCode/u],
+  ["expired_trigger_id", /Slack's request to open this window expired/u],
+  ["invalid_trigger_id", /Slack couldn't use the request to open this window/u],
+  ["invalid_arguments", /Slack rejected the model window.*Pipa issue/u],
+  ["unknown_slack_error", /Slack couldn't open the model window/u],
+]) test(`picker opening explains ${failure} without blaming access or exposing upstream details`, async () => {
+  let open;
+  const replies = [];
+  const notices = [];
+  const picker = createModelPicker({ chat: { onSlashCommand: (_id, fn) => { open = fn; } }, botName: "Chopper", commands: ["/chopper"], setting: {},
+    loadConfig: async () => {
+      if (failure === "configuration") throw new Error("private-settings-secret");
+      return failure === "access" ? { allowedSlackUserIds: ["U2"] } : {};
+    },
+    listModels: async () => {
+      if (failure === "models") throw new Error("private-provider-secret");
+      return [{ providerID: "openai", modelID: "a" }];
+    } });
+  await open({ text: "model", user: { userId: "U1" }, channel: { id: "slack:C1", postEphemeral: async (...args) => replies.push(args) },
+    adapter: { webClient: { views: {
+      open: async () => { if (failure === "models") return { view: { id: "V1" } }; throw Object.assign(new Error("private-slack-secret"), { data: { error: failure } }); },
+      update: async ({ view }) => { notices.push(view.blocks[0].text.text); },
+    } } } });
+  assert.equal(replies.length + notices.length, 1);
+  const message = replies[0]?.[1] ?? notices[0];
+  assert.match(message, expected);
+  assert.match(message, /saved model hasn't changed/u);
+  assert.doesNotMatch(message, /private-|Check your access/u);
+  if (replies.length) assert.equal(replies[0][2].fallbackToDM, false);
+  picker.close();
 });

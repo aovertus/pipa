@@ -20,7 +20,7 @@ For model-selection changes, iterate with `node --test test/state.test.mjs test/
 
 Use a distinct Slack test app and a separate `PIPA_HOME` (the parent of `.pipa`), with its own app/bot tokens, working directory, and channel/user allowlists. Install the slash command derived from its configured `botName` (for example, `Chopper` -> `/chopper`) and grant `commands`. The generated manifest also suggests `/pipa`; omit that alias when another app already owns it, unless intentionally transferring that command. Enable Socket Mode and interactivity, reinstall or reauthorize, and invite the test app to the allowed channel. The generated manifest and runtime must use the same normalized name; a Slack app/bot rename alone does not update command registration or local config. Never run a second Socket listener with production credentials or restart production Pipa for a smoke test.
 
-1. Open the installation's model command (for example `/chopper model`), search and save model A, then reopen to verify the selection.
+1. Open the installation's model command (for example `/chopper model`), verify the loading window becomes a populated provider-grouped list, choose and save model A, wait for the private saved confirmation, then reopen to verify the selection. Closing the loading window must not reopen it when discovery finishes.
 2. Send an ordinary request and inspect the completed OpenCode assistant message's provider/model metadata. HTTP acceptance or asking the model which model it is does not prove selection.
 3. Save model B and reply in that same Slack thread. Verify completed metadata names B and that the session/history is retained.
 4. Cancel another picker and verify no setting changed. Restart only the test profile and reopen to verify persistence.

@@ -283,6 +283,7 @@ export async function startPipa(options = {}) {
       try {
         await withTimeout((async () => {
           await interactions.close();
+          await modelPicker.drain();
           await routineScheduler?.drain();
           await runner.drain();
           await chat.shutdown();
