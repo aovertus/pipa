@@ -106,23 +106,24 @@ export function createModelPicker({ chat, botName, commands, loadConfig, listMod
     }
   });
 
-  chat.onModalSubmit?.("pipa_model", async (event) => {
+  chat.onModalSubmit?.("pipa_model", (event) => {
     const entry = pending.get(event.privateMetadata);
     const inputId = `pipa_model_${event.privateMetadata}`;
     try {
-      const config = await loadConfig();
-      authorize(pending.get(event.privateMetadata), event, config);
+      authorize(entry, event, {});
     } catch {
       return { action: "errors", errors: { [inputId]: `I couldn't verify this model change. Reopen ${command} model. Your saved model hasn't changed.` } };
     }
     if (entry.saving) return { action: "close" };
     entry.saving = true;
-    // Acknowledge Save without putting catalog/network/persistence work on Slack's deadline.
+    // Acknowledge Save before config I/O as well as catalog/network/persistence work.
     const task = (async () => {
       let message;
-      let failure = `I couldn't check the available models in OpenCode. Reopen ${command} model to try again. Your saved model hasn't changed.`;
+      let failure = `I couldn't verify this model change. Reopen ${command} model. Your saved model hasn't changed.`;
       try {
         try {
+          authorize(entry, event, await loadConfig());
+          failure = `I couldn't check the available models in OpenCode. Reopen ${command} model to try again. Your saved model hasn't changed.`;
           const models = await listModels();
           const model = models.find((item) => modelOption(item).value === event.values?.[inputId]);
           failure = `That model is no longer available. Reopen ${command} model and choose another. Your saved model hasn't changed.`;

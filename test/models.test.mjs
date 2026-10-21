@@ -5,11 +5,97 @@ import path from "node:path";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { Chat } from "chat";
-import { createSlackAdapter } from "@chat-adapter/slack";
 import { createMemoryState } from "@chat-adapter/state-memory";
-import { startPipa } from "../src/app.mjs";
+import { createPipaSlackAdapter, startPipa } from "../src/app.mjs";
 import { createModelPicker } from "../src/models.mjs";
 import { createModelSetting, createSessionStore, loadConfig, pipaPaths, writePrivateJson } from "../src/state.mjs";
+
+for (const revoked of [false, true]) test(`native Save acknowledges before config I/O; ${revoked ? "revoked access prevents discovery and writes" : "authorized save persists afterward"}`, async (t) => {
+  const adapter = createPipaSlackAdapter({ signingSecret: "test", botToken: "xoxb-test", botUserId: "UPIPA", userName: "Chopper" });
+  const chat = new Chat({ adapters: { slack: adapter }, state: createMemoryState(), userName: "Chopper", logger: "silent" });
+  const gate = Promise.withResolvers();
+  const reading = Promise.withResolvers();
+  let submitting = false;
+  let discoveries = 0;
+  let writes = 0;
+  let view;
+  const notices = [];
+  adapter._client.users.info = async () => ({ user: { id: "U1", name: "User" } });
+  adapter.webClient.views.open = async () => ({ view: { id: "V1" } });
+  adapter.webClient.views.update = async (input) => { view = input.view; };
+  adapter.postEphemeral = async (...args) => notices.push(args);
+  const config = { allowedSlackUserIds: ["U1"], allowedSlackChannelIds: ["C1"] };
+  const picker = createModelPicker({ chat, botName: "Chopper", commands: ["/chopper"],
+    loadConfig: async () => { if (submitting) { reading.resolve(); await gate.promise; } return config; },
+    listModels: async () => { discoveries++; return [{ providerID: "openai", modelID: "a" }]; },
+    setting: { save: async (_model, authorize) => { authorize(config); writes++; } } });
+  await chat.initialize();
+  t.after(async () => { gate.resolve(); picker.close(); await picker.drain(); await chat.shutdown(); });
+  const waiting = [];
+  await adapter.handleSlashCommand(new URLSearchParams({ command: "/chopper", text: "model", user_id: "U1", channel_id: "C1", trigger_id: "trigger" }), { waitUntil: (p) => waiting.push(p) });
+  await Promise.all(waiting);
+  const input = view.blocks[0].element;
+  const payload = { type: "view_submission", user: { id: "U1" }, view: { ...view, id: "V1",
+    state: { values: { [input.action_id]: { [input.action_id]: { selected_option: input.option_groups[0].options[0] } } } } } };
+  submitting = true;
+  const acknowledgments = [];
+  const routing = adapter.routeSocketEvent(payload, "interactive", async (response) => acknowledgments.push(response));
+  try {
+    await reading.promise;
+    assert.equal(await Promise.race([routing.then(() => true), delay(100).then(() => false)]), true, "Slack acknowledgment must not wait for the config read");
+    assert.deepEqual(acknowledgments, [{}]);
+    await adapter.routeSocketEvent(payload, "interactive", async (response) => acknowledgments.push(response));
+    assert.equal(discoveries, 1, "no save-time discovery before fresh authorization");
+    assert.equal(writes, 0);
+    assert.equal(notices.length, 0);
+    if (revoked) config.allowedSlackUserIds = ["U2"];
+  } finally {
+    gate.resolve();
+    await routing;
+    await picker.drain();
+  }
+  assert.equal(discoveries, revoked ? 1 : 2);
+  assert.equal(writes, revoked ? 0 : 1);
+  assert.equal(notices.length, revoked ? 0 : 1);
+});
+
+for (const command of ["/chopper", "/pipa"]) test(`${command} opens without waiting for cold SDK profile enrichment`, async (t) => {
+  const adapter = createPipaSlackAdapter({ signingSecret: "test", botToken: "xoxb-test", botUserId: "UPIPA", userName: "Chopper" });
+  const chat = new Chat({ adapters: { slack: adapter }, state: createMemoryState(), userName: "Chopper", logger: "silent" });
+  const gate = Promise.withResolvers();
+  const opened = Promise.withResolvers();
+  let lookups = 0;
+  const requests = [];
+  adapter._client.users.info = async () => { lookups++; await gate.promise; return { user: { id: "U1", name: "User" } }; };
+  adapter.webClient.views.open = async (input) => { requests.push(input); opened.resolve(); return { view: { id: "V1" } }; };
+  adapter.webClient.views.update = async () => undefined;
+  const picker = createModelPicker({ chat, botName: "Chopper", commands: ["/chopper", "/pipa"], loadConfig: async () => ({ allowedSlackUserIds: ["U1"], allowedSlackChannelIds: ["C1"] }),
+    listModels: async () => [{ providerID: "openai", modelID: "a" }], setting: {} });
+  await chat.initialize();
+  t.after(async () => { gate.resolve(); picker.close(); await chat.shutdown(); });
+  const waiting = [];
+  const context = { waitUntil: (p) => waiting.push(p) };
+  const params = new URLSearchParams({ command, text: "model", user_id: "U1", channel_id: "C1", trigger_id: "trigger" });
+  const opening = adapter.handleSlashCommand(params, context);
+  try {
+    assert.equal(await Promise.race([opened.promise.then(() => true), delay(100).then(() => false)]), true, "modal trigger must be exchanged without waiting for users.info");
+    await opening;
+    await Promise.all(waiting);
+    assert.equal(lookups, 0);
+    assert.equal(requests[0].trigger_id, "trigger");
+  } finally {
+    gate.resolve();
+    await opening;
+    await Promise.all(waiting);
+  }
+  let unrelated = false;
+  chat.onSlashCommand("/other", async () => { unrelated = true; });
+  await adapter.handleSlashCommand(new URLSearchParams({ ...Object.fromEntries(params), command: "/other" }), context);
+  await Promise.all(waiting);
+  assert.equal(lookups, 1, "other commands keep the SDK's profile lookup");
+  assert.equal(unrelated, true);
+  assert.equal(requests.length, 1);
+});
 
 for (const shutdown of [false, true]) test(`Save acknowledges before slow work; ${shutdown ? "shutdown prevents stale writes and delivery" : "confirmation follows persistence"}`, async () => {
   const handlers = {};
@@ -112,8 +198,8 @@ for (const [botName, command] of [["Chopper", "/chopper"], ["Chopper", "/pipa"],
   const paths = pipaPaths(await mkdtemp(path.join(os.tmpdir(), "pipa-native-model-")));
   const config = { botName, workingDirectory: "/work", slackAppToken: "xapp-test", slackBotToken: "xoxb-test", allowedSlackUserIds: ["U1"], allowedSlackChannelIds: ["C1"] };
   await writePrivateJson(paths.config, config);
-  const adapter = createSlackAdapter({ signingSecret: "test", botToken: "xoxb-test", botUserId: "UPIPA", userName: "Pipa" });
-  adapter.lookupUser = async () => ({ displayName: "User" });
+  const adapter = createPipaSlackAdapter({ signingSecret: "test", botToken: "xoxb-test", botUserId: "UPIPA", userName: botName });
+  adapter._client.users.info = async () => ({ user: { id: "U1", name: "User" } });
   const views = [];
   const notices = [];
   adapter.postEphemeral = async (...args) => { notices.push(args); return { id: "private" }; };
@@ -232,7 +318,8 @@ test("private picker preloads/saves/reopens/cancels without inference and rechec
   await handlers.slash(opening);
   await writePrivateJson(paths.config, { ...config, allowedSlackUserIds: ["U2"] });
   const denied = await handlers.submit({ ...submission, privateMetadata: JSON.parse(modal.private_metadata).m });
-  assert.equal(denied.action, "errors");
+  assert.equal(denied.action, "close", "fresh access checks run after acknowledgment");
+  await picker.drain();
   assert.equal((await loadConfig(paths.config)).defaultModel, undefined);
   picker.close();
 });
@@ -307,7 +394,8 @@ test("picker failure paths never persist and preloaded groups respect Slack boun
   await handlers.open(event);
   save = submission();
   config.allowedSlackChannelIds = ["C2"];
-  assert.equal((await handlers.save(save)).action, "errors");
+  assert.equal((await handlers.save(save)).action, "close");
+  await picker.drain();
   assert.equal(writes, 1);
   config.allowedSlackChannelIds = ["C1"];
   clock = 31 * 60_000;

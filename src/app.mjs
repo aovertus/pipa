@@ -299,6 +299,21 @@ export async function startPipa(options = {}) {
 
 export function createPipaSlackAdapter(options, drainTimeoutMs = 3_000) {
   const adapter = createSlackAdapter(options);
+  const slashCommand = adapter.handleSlashCommand.bind(adapter);
+  const commands = slackCommandNames(options.userName ?? "Pipa");
+  adapter.handleSlashCommand = async (params, context) => {
+    if (!adapter.chat || !commands.includes(params.get("command")) || params.get("text")?.trim() !== "model") return slashCommand(params, context);
+    // The pinned SDK awaits users.info before dispatch. Picker authorization needs
+    // only envelope IDs; optional profile enrichment must not expire the trigger.
+    const userId = params.get("user_id") ?? "";
+    adapter.chat.processSlashCommand({
+      command: params.get("command"), text: params.get("text"),
+      user: { userId, userName: params.get("user_name") || userId, fullName: params.get("user_name") || userId, isBot: false, isMe: false },
+      adapter, raw: Object.fromEntries(params), triggerId: params.get("trigger_id") || undefined,
+      channelId: params.get("channel_id") ? `slack:${params.get("channel_id")}` : "",
+    }, context);
+    return new Response("", { status: 200 });
+  };
   const route = adapter.routeSocketEvent.bind(adapter);
   const disconnect = adapter.disconnect.bind(adapter);
   const pending = new Set();

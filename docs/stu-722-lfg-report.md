@@ -6,9 +6,21 @@ Date: 2026-10-20. Harness/model: OpenCode / `openai/gpt-6.1-sol`.
 
 Current release target: **0.5.5**, corrected from the intermediate `0.6.0` bump at the user's request. No tag, npm publish, merge, or production restart has been performed.
 
-Implemented installation-wide model persistence, ordinary request selection, routine snapshots, native Slack picker, manifest command/scope, and setup documentation.
+Implemented installation-wide model persistence for new threads, existing-thread model retention, routine snapshots, native Slack picker, manifest command/scope, and setup documentation.
 The initial checkout collision was resolved with the user's authorization: unrelated no-reply work is preserved in stash `deferred no-reply changes before STU-722`. The stash and pre-existing `tmp/` evaluation data remain untouched.
 The production Pipa process, production Slack app settings, and production config were not modified or restarted. A distinct temporary Slack app/profile was created for live smoke, then removed after verification.
+
+## Current behavior and review corrections (2026-10-21)
+
+Commit `d361ee9` superseded the original per-request switching behavior: existing threads retain their recorded model, while new threads use the latest saved default. New routines still snapshot that default at creation. `test/opencode.test.mjs` verifies existing-thread retention across executor restarts and the default used for new threads. Native picker tests verify saved-default forwarding and session reuse with a stubbed executor; they do not establish completed provider selection.
+
+The A/B same-session switching observations below predate `d361ee9`. They remain historical evidence of the earlier implementation, not live verification of current thread retention. No fresh live Slack/provider smoke is claimed for this behavior change or the following deadline fixes.
+
+The follow-up review reproduced two Slack deadline gaps. Save awaited config I/O before acknowledging its modal submission; the SDK also awaited optional user-profile enrichment before dispatching the model command. Save now performs synchronous context checks and acknowledges before fresh config authorization, discovery, and persistence. The adapter dispatches only this installation's model commands using payload identity without awaiting `users.info`; other commands keep the SDK path. Authorization remains checked before discovery, during persistence, and before private delivery.
+
+Native regressions first failed for both delays, then passed with config reads or profile responses held behind gates. Coverage includes duplicate Save, revoked access preventing discovery/writes, both named and alias commands, and normal enrichment for unrelated commands. Historical test and CI receipts below remain tied to their stated heads.
+
+Follow-up local verification: `node --test test/models.test.mjs test/app.test.mjs` passed all 89 tests; `npm test -- --test-reporter=dot`, `npm run test:pack`, and `git diff --check` passed. The full suite and package smoke passed again before committing the follow-up. Three scoped reuse/quality/efficiency reviews recommended no further simplification, and a separate fix-only correctness/security review found no new defects. These used the same model; no cross-model corroboration is claimed. The PR description was corrected to match `d361ee9`. This verification covers the follow-up edits based on that commit; remote CI results are reported separately.
 
 ## Plan and review
 
@@ -40,8 +52,8 @@ Planning confidence and document review ran inline. Persona passes were performe
 | Unit | Pre-change evidence | Protection and outcome |
 |---|---|---|
 | U1 | Owning state/executor suites inspected; focused run failed on missing persistence export and absent payload model | State save/reload/preservation, queued writes, failed-write recovery, private permissions, native parts/system/model, stale-session replacement and caller-mutation isolation pass |
-| U2 | App/routines/CLI suites inspected; new assertions failed on missing snapshot, inherited preview, and dispatch model | Legacy absent/null, immutable edit snapshot, CLI preview inheritance, routine A versus ordinary follow-up B in the same session pass |
-| U3 | New picker suite failed before module existed | Native installed SDK/adapter command/options/Save/reopen/Cancel and A→B same-session requests pass; denied/foreign/expired contexts, unknown selection, discovery errors, failed writes, option/label bounds, manifest, authenticated catalog and timeout pass |
+| U2 | App/routines/CLI suites inspected; new assertions failed on missing snapshot, inherited preview, and dispatch model | Legacy absent/null, immutable edit snapshot, CLI preview inheritance, and routine snapshot dispatch pass. Existing-thread retention and new-thread defaults are verified separately by the executor suite. |
+| U3 | New picker suite failed before module existed | Native installed SDK/adapter command/choices/Save/reopen/Cancel and default forwarding with session reuse pass; denied/foreign/expired contexts, unknown selection, discovery errors, failed writes, option/label bounds, manifest, authenticated catalog and timeout pass |
 | U4 | Non-behavioral docs use code/source review; package smoke extended | Installed picker import, command/scope manifest, inherited routine preview, initialization/cancellation/Managed start pass |
 
 Exact successful commands (exit 0):
@@ -56,13 +68,13 @@ The native routing test replaces only outbound Slack calls. It does not start a 
 
 ## Named commands, compatibility alias, and existing-user upgrade
 
-The user superseded the original universal-command design with name-derived commands, then requested `/pipa` compatibility as well. Manifest generation and handler startup now share `slackCommandNames`: the normalized named command plus `/pipa`, deduplicated for `Pipa`. Both entry points share the same private picker, authorization and persistence paths; usage/error recovery points to the named command. The modal label and confirmation show the installation's configured name. Named examples remain `Pipa` -> `/pipa`, `Chopper` -> `/chopper`, `Pipwick` -> `/pipwick`, `Workshop "Bot"` -> `/workshop-bot`, `Café 🧪` -> `/cafe`.
+The user superseded the original universal-command design with name-derived commands, then requested `/pipa` compatibility as well. Manifest generation and handler startup now share `slackCommandNames`: the normalized named command plus `/pipa`, deduplicated for `Pipa`. Both entry points share the same private picker, authorization and persistence paths; usage/error recovery points to the named command. The modal label shows the installation's configured name; the confirmation reports the default for new threads. Named examples remain `Pipa` -> `/pipa`, `Chopper` -> `/chopper`, `Pipwick` -> `/pipwick`, `Workshop "Bot"` -> `/workshop-bot`, `Café 🧪` -> `/cafe`.
 
 Normalization uses Unicode compatibility decomposition with combining-mark removal, lowercase ASCII letters/digits, hyphen-separated non-alphanumeric runs, edge-hyphen removal, and at most 31 characters after `/`. Valid display names with no usable ASCII slug now fall back to `/pipa`, preserving startup for old emoji/non-Latin profiles; empty/overlong/multiline names remain subject to the original display-name validation. Distinct names may normalize identically; operators must choose distinct resulting commands. No command-override config, dependency, or model-selection lifetime change was added. The local template includes both command forms by default; operators should omit `/pipa` from other apps' remote manifests in a multi-install workspace or assign it to exactly one app. A runtime handler cannot bypass Slack registration or reroute a colliding global alias.
 
 Slack's [manifest reference](https://docs.slack.dev/reference/app-manifest/) specifies a maximum of 32 characters including `/`. The app-management form was inspected without saving and states that commands start with `/`, are lowercase, and contain no spaces. The implementation uses the conservative letter/digit/hyphen subset. Slack's [command guide](https://docs.slack.dev/interactivity/implementing-slash-commands/) confirms that commands are not namespaced and the most recently installed app wins a collision.
 
-The earlier name-only correction had no alias. In this follow-up, focused tests first failed on absent alias registration/dispatch, missing installation identity, absent manifest export, and absent commands-scope guidance. Native SDK/adapter tests now cover `/chopper` or `/pipa` for Chopper, `/pipwick` or `/pipa` for Pipwick, and the deduplicated `/pipa` for Pipa. They exercise denied users, options/Save/reopen/Cancel and same-session model changes. The state suite preserves naming boundaries; package smoke checks both `/pack-bot` and `/pipa`.
+The earlier name-only correction had no alias. In this follow-up, focused tests first failed on absent alias registration/dispatch, missing installation identity, absent manifest export, and absent commands-scope guidance. Native SDK/adapter tests now cover `/chopper` or `/pipa` for Chopper, `/pipwick` or `/pipa` for Pipwick, and the deduplicated `/pipa` for Pipa. They exercise denied users, choices/Save/reopen/Cancel and default changes while reusing the same session; the executor suite verifies retained thread models. The state suite preserves naming boundaries; package smoke checks both `/pack-bot` and `/pipa`.
 
 `pipa manifest` loads the existing config read-only and prints the current local manifest template without tokens. CLI regression tests prove config/defaultModel, sessions, routines, and cached manifest bytes are unchanged; unsupported apply flags are rejected and help works without a configured profile. It does not query/update Slack, acquire an instance lock, or run inference. The README explains merging only desired command/scope additions into an existing remote/custom manifest, reauthorizing the same app, retaining tokens unless Slack rotates them, and restarting the same profile. Rerunning `pipa init` or replacing credentials is not the existing-user upgrade path.
 
@@ -83,6 +95,8 @@ State tests cover `🤖`, `東京`, and punctuation-only names. New app regressi
 Fallback verification: the focused state/app suites, full `npm test -- --test-reporter=dot`, and `npm run test:pack` exited 0 at `0.5.5`. The scoped review against `e54899e` completed with no actionable findings (`run_id: stu722-fallback-review`); it ran inline without independent promotion. The production fix is one return expression, so no simplification refactor was warranted.
 
 ## Fresh verification on `a1214a3` (named command and alias)
+
+This was fresh evidence for `a1214a3`, before `d361ee9` changed model-selection lifetime. Its same-thread switching results do not verify the current retention behavior.
 
 The focused state/executor/model/app/routine/CLI suites, `npm test -- --test-reporter=dot`, and `npm run test:pack` were rerun successfully against `a1214a36271efaefa8eb77c9654312308efeebec`, version **0.5.5**. The final evidence commit changes this report only.
 
@@ -121,7 +135,7 @@ Focused app/model tests, full `npm test -- --test-reporter=dot`, and `npm run te
 
 ## Historical live smoke evidence (before command-name correction)
 
-This smoke used the then-universal `/pipa` command. It remains evidence for model selection/history/Cancel/restart semantics, but does not prove live custom-command registration in the revised implementation. The custom commands are covered by the native automated adapter tests described above.
+This smoke used the then-universal `/pipa` command. It records the earlier model switching/history/Cancel/restart behavior, but does not verify the current thread-retention behavior introduced in `d361ee9` or live custom-command registration in the revised implementation. The custom commands are covered by the native automated adapter tests described above.
 
 The initial absence of an isolated profile was resolved using the already authenticated app-management browser. The generated manifest was accepted by Slack to create **Pipa Model Test 722**, app `A0CA6RMHH7H`, with its own app/bot tokens, `/pipa`, `commands`, and Socket Mode. The test bot was invited to the allowed `#test-prod-pipa` channel. Only this distinct profile's Socket listener was started; it attached to the existing OpenCode server with a separate temporary workspace and never owned or restarted that server.
 
@@ -146,7 +160,7 @@ Code review found one P1 ordering regression at the new pre-enqueue config read.
 
 Review coverage: correctness, scoped project standards, testing, security, reliability, adversarial, API contract, and agent-native passes ran inline. No independent agreement promotion was used. A separate validator was unavailable; the P1 was retained validation-degraded during review and then proved by the red/green regression. No actionable findings or settled-decision conflicts remain.
 
-Browser/native smoke result: **PASS** for open/search/Save/reopen/Cancel and test-only restart persistence, using the existing authenticated browser and the distinct test app. Completed A/B execution metadata and retained history were verified separately through the OpenCode API. This CLI has no local web routes or browser dev server.
+Historical browser/native smoke result: **PASS** for open/search/Save/reopen/Cancel and test-only restart persistence, using the existing authenticated browser and the distinct test app. Completed A/B execution metadata and retained history were verified separately through the OpenCode API before `d361ee9`; this is not live verification of current thread retention. This CLI has no local web routes or browser dev server.
 
 PR: https://github.com/lunchpaillola/pipa/pull/41 . The pipeline snapshot for head `ee6a771` reported all checks terminal/successful, `MERGEABLE`, `CLEAN`, current-base identity proven, zero actionable feedback, and no branch-currency or human-decision blocker. The final live-evidence documentation update is checked again on its new head; the babysitter's final return and PR run-report comment record that outcome without another CI-triggering report edit.
 
@@ -166,7 +180,7 @@ PR: https://github.com/lunchpaillola/pipa/pull/41 . The pipeline snapshot for he
     {"unit": "U1", "behavior_changed": true, "existing_tests_inspected": ["test/state.test.mjs", "test/opencode.test.mjs"], "tests_added_or_changed": ["test/state.test.mjs", "test/opencode.test.mjs"], "tests_used_unchanged": "Other state/executor cases", "red_observed": "Missing setting export and absent native payload model", "result": "Owning suites exit 0"},
     {"unit": "U2", "behavior_changed": true, "existing_tests_inspected": ["test/app.test.mjs", "test/routines.test.mjs", "test/cli.test.mjs"], "tests_added_or_changed": ["test/app.test.mjs", "test/routines.test.mjs", "test/cli.test.mjs"], "tests_used_unchanged": "Other app/routine/CLI cases", "red_observed": "Absent dispatch snapshot, preview inheritance, null retention", "result": "Owning suites exit 0"},
     {"unit": "U3", "behavior_changed": true, "existing_tests_inspected": ["test/app.test.mjs", "test/state.test.mjs", "test/opencode.test.mjs"], "tests_added_or_changed": ["test/models.test.mjs", "test/state.test.mjs", "test/opencode.test.mjs"], "tests_used_unchanged": "Existing permission/question/shutdown cases", "red_observed": "Picker module absent before implementation", "result": "Native adapter, failure matrix, authenticated catalog, timeout suites exit 0"},
-    {"unit": "U4", "behavior_changed": false, "existing_tests_inspected": ["scripts/pack-smoke.mjs"], "tests_added_or_changed": ["scripts/pack-smoke.mjs"], "tests_used_unchanged": "Installed initialization and Managed smoke", "result": "Full suite and pack smoke exit 0; isolated live native picker, completed A/B metadata, same-session history, Cancel, and test-only restart passed", "exception_reason": "No local web routes; native Slack UI used instead"}
+    {"unit": "U4", "behavior_changed": false, "existing_tests_inspected": ["scripts/pack-smoke.mjs"], "tests_added_or_changed": ["scripts/pack-smoke.mjs"], "tests_used_unchanged": "Installed initialization and Managed smoke", "result": "Historical full suite and pack smoke exit 0; isolated live native picker, completed A/B metadata, same-session history, Cancel, and test-only restart passed before d361ee9; not live verification of current thread retention", "exception_reason": "No local web routes; native Slack UI used instead"}
   ],
   "implementation_engine_binding": null,
   "requested_route": "native",
