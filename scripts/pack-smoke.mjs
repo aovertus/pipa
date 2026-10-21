@@ -20,6 +20,8 @@ try {
   const installedRoot = path.join(directory, "install", "node_modules", "@usepipa", "pipa");
   const packedRuntime = await import(pathToFileURL(path.join(installedRoot, "src", "opencode.mjs")).href);
   if (typeof packedRuntime.createOpenCodeExecutor !== "function") throw new Error("Packed OpenCode executor is unavailable.");
+  const packedModels = await import(pathToFileURL(path.join(installedRoot, "src", "models.mjs")).href);
+  if (typeof packedModels.createModelPicker !== "function") throw new Error("Packed model picker is unavailable.");
   const packedRestart = await import(pathToFileURL(path.join(installedRoot, "src", "restart.mjs")).href);
   if (typeof packedRestart.startRestartWatcher !== "function" || typeof packedRestart.runRestartWorker !== "function") throw new Error("Packed restart worker is unavailable.");
   const installedCli = path.join(installedRoot, "bin", "pipa.mjs");
@@ -77,13 +79,22 @@ if (process.argv[2] === "--version") {
   const manifest = JSON.parse(await readFile(path.join(home, ".pipa", "slack-manifest.json"), "utf8"));
   if (config.botName !== "Pack Bot" || config.workingDirectory !== await realpath(workingDirectory)) throw new Error("Packed init wrote invalid config.");
   if (manifest.display_information.name !== "Pack Bot") throw new Error("Packed init wrote invalid manifest.");
-  if (!["channels:read", "assistant:write"].every((scope) => manifest.oauth_config.scopes.bot.includes(scope))) throw new Error("Packed init wrote incomplete Slack bot scopes.");
+  if (!["channels:read", "assistant:write", "commands"].every((scope) => manifest.oauth_config.scopes.bot.includes(scope))) throw new Error("Packed init wrote incomplete Slack bot scopes.");
+  if (JSON.stringify(manifest.features.slash_commands.map((entry) => entry.command)) !== JSON.stringify(["/pack-bot", "/pipa"])) throw new Error("Packed manifest omitted named/compatibility commands.");
+  config.defaultModel = { providerID: "openai", modelID: "pack-model" };
+  await writeFile(path.join(home, ".pipa", "config.json"), JSON.stringify(config));
+  const beforeExport = await readFile(path.join(home, ".pipa", "config.json"), "utf8");
+  const exported = await run(process.execPath, [installedCli, "manifest"], { ...process.env, PIPA_HOME: home });
+  if (JSON.stringify(JSON.parse(exported.stdout)) !== JSON.stringify(manifest)) throw new Error("Packed manifest export did not use the existing profile.");
+  if (/xapp-test|xoxb-test/u.test(exported.stdout)) throw new Error("Packed manifest export exposed credentials.");
+  if (await readFile(path.join(home, ".pipa", "config.json"), "utf8") !== beforeExport) throw new Error("Packed manifest export changed config.");
 
   const preview = await run(process.execPath, [installedCli, "routine", "create", "--prompt", "Pack preview", "--timezone", "America/New_York", "--channel", "C123", "--every", "1d", "--times", "05:00", "--preview", "--json"], {
     ...process.env,
     PIPA_HOME: home,
   }, "", workingDirectory);
   const previewJson = JSON.parse(preview.stdout);
+  if (JSON.stringify(previewJson.routine.model) !== JSON.stringify(config.defaultModel)) throw new Error("Packed routine preview lost the model snapshot.");
   if (!previewJson.ok || !previewJson.preview || previewJson.routine.schedule.frequency !== "daily" || previewJson.routine.schedule.times[0] !== "05:00") {
     throw new Error("Packed routine preview returned invalid normalized JSON.");
   }

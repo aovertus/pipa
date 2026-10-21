@@ -28,9 +28,18 @@ async function main(argv = process.argv.slice(2), io = { input: stdin, output: s
   if (command === "stop") return stop(io);
   if (command === "restart") return restart(argv.slice(1), io);
   if (command === "routine") return routine(argv.slice(1), io);
-  const usage = "Usage: pipa init | pipa start | pipa stop | pipa restart [--status] | pipa routine | pipa --version";
+  if (command === "manifest") return manifest(argv.slice(1), io);
+  const usage = "Usage: pipa init | pipa start | pipa stop | pipa restart [--status] | pipa routine | pipa manifest | pipa --version";
   if (command === "--help" || command === "-h") return io.output.write(`${usage}\n`);
   throw new Error(usage);
+}
+
+async function manifest(argv, io) {
+  const usage = "Usage: pipa manifest\nPrint the current local Slack manifest template from the existing profile without credentials. This does not update Slack or local state.\n";
+  if (argv.length === 1 && ["--help", "-h"].includes(argv[0])) return io.output.write(usage);
+  if (argv.length) throw new Error(usage.trim());
+  const config = await loadConfig();
+  io.output.write(`${JSON.stringify(createManifest(config.botName), null, 2)}\n`);
 }
 
 async function restart(argv, io) {
@@ -137,7 +146,7 @@ async function routine(argv, io) {
   const changes = await routineInput(values, command === "create", now, config.workingDirectory);
   const options = { now, allowedChannelIds: config.allowedSlackChannelIds ?? [] };
   const result = command === "create"
-    ? await createRoutine({ id, ...changes }, { ...options, preview: values.preview === true })
+    ? await createRoutine({ id, ...changes, model: config.defaultModel ?? null }, { ...options, preview: values.preview === true })
     : await editRoutine(id, changes, options);
   const preview = command === "create" && values.preview === true;
   return writeRoutineResult(io.output, json, { routine: result, ...(preview ? { preview: true } : {}) }, preview

@@ -4,6 +4,7 @@ import { chmod, lstat, mkdir, mkdtemp, open, realpath, rm, writeFile } from "nod
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { normalizeModel } from "./state.mjs";
 
 const SLACK_SECRET_ENV_KEY = /(?:^|_)SLACK(?:_[A-Z0-9]+)*_(?:TOKEN|SECRET)$/iu;
 const LISTENING_URL = /https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+/u;
@@ -124,9 +125,11 @@ export function createOpenCodeExecutor(options = {}) {
     }
   }
 
-  async function runTurn({ prompt, sessionId, workingDirectory, contextEnvironment = {}, attachments = [], signal, onSession, onInteraction, onPermissionReplied, onPermissionsReconciled }) {
+  async function runTurn({ prompt, sessionId, model, defaultModel, workingDirectory, contextEnvironment = {}, attachments = [], signal, onSession, onInteraction, onPermissionReplied, onPermissionsReconciled }) {
     if (!prompt?.trim()) throw new Error("A prompt is required.");
     if (stopReason) throw stopReason;
+    let selectedModel = normalizeModel(model);
+    const newThreadModel = normalizeModel(defaultModel);
     const temporaryDirectory = attachments.length ? await mkdtemp(path.join(os.tmpdir(), "pipa-files-")) : null;
     const slackTurn = contextEnvironment.PIPA_MESSAGE_CHANNEL === "slack";
     const controller = new AbortController();
@@ -162,6 +165,13 @@ export function createOpenCodeExecutor(options = {}) {
           messages = [];
         }
 
+        if (!selectedModel) {
+          // OpenCode history persists the thread's model, including interrupted user turns.
+          const last = messages.at(-1)?.info;
+          const threadModel = last?.role === "user" ? last.model
+            : last?.providerID && last?.modelID ? { providerID: last.providerID, modelID: last.modelID } : null;
+          selectedModel = normalizeModel(threadModel) ?? newThreadModel;
+        }
         activeSessions.set(selectedSessionId, { controller, workingDirectory });
         await onSession?.(selectedSessionId);
         if (controller.signal.aborted) throw controller.signal.reason;
@@ -198,7 +208,7 @@ export function createOpenCodeExecutor(options = {}) {
         }
         await request(`/session/${encodeURIComponent(selectedSessionId)}/prompt_async`, {
           method: "POST",
-          body: JSON.stringify(promptBody(prompt, files, contextEnvironment, artifactDirectory)),
+          body: JSON.stringify({ ...promptBody(prompt, files, contextEnvironment, artifactDirectory), ...(selectedModel ? { model: selectedModel } : {}) }),
         }, workingDirectory, controller, [204]);
 
         while (true) {
@@ -209,7 +219,22 @@ export function createOpenCodeExecutor(options = {}) {
           const finalMessage = latestAssistantMessage(currentMessages, baseline);
           const status = statuses?.[selectedSessionId]?.type;
           if (dismissed && status !== "busy" && status !== "retry") return { text: "", sessionId: selectedSessionId };
-          if (["error", "failed", "cancelled"].includes(status) || finalMessage?.error) throw new Error("OpenCode failed to complete the turn.");
+          if (finalMessage?.error) {
+            const error = finalMessage.error;
+            const providerID = finalMessage.providerID ?? selectedModel?.providerID;
+            const provider = typeof providerID === "string" && /^[a-z0-9][a-z0-9._-]{0,63}$/iu.test(providerID) ? `provider "${providerID}"` : "selected provider";
+            const statusCode = error.data?.statusCode;
+            const http = Number.isInteger(statusCode) && statusCode >= 400 && statusCode <= 599 ? ` (HTTP ${statusCode})` : "";
+            // Classify upstream failures without exposing response bodies, headers, or credentials.
+            if (statusCode === 401 || error.name === "ProviderAuthError") {
+              const expiredKey = statusCode === 401 && typeof error.data?.message === "string" && /\bAPI key (?:has )?expired\b/iu.test(error.data.message);
+              throw new Error(expiredKey
+                ? `OpenCode ${provider} API key has expired. Replace that provider's API key in OpenCode, or choose another provider with your installation's model command, then start a new thread.`
+                : `OpenCode ${provider} authentication failed${http}. Reconnect that provider in OpenCode, or choose another provider with your installation's model command, then start a new thread.`);
+            }
+            throw new Error(`OpenCode ${provider} ${http ? `failed${http}` : "failed to complete the turn"}.`);
+          }
+          if (["error", "failed", "cancelled"].includes(status)) throw new Error("OpenCode failed to complete the turn.");
           if (finalMessage && ((status !== "retry" && finalMessage.completed && finalMessage.finish === "stop") || status === "idle" || (!status && finalMessage.completed))) {
             if (!finalMessage.text && permissionRejected) return { text: "Stopped after a permission was rejected.", sessionId: selectedSessionId };
             if (!finalMessage.text) throw new Error("OpenCode completed without assistant text.");
@@ -254,6 +279,26 @@ export function createOpenCodeExecutor(options = {}) {
 
   return {
     runTurn,
+    async listModels(workingDirectory) {
+      if (stopReason) throw stopReason;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(new Error("Model discovery timed out.")), 1_500);
+      active.add(controller);
+      try {
+        const catalog = await request("/config/providers", { method: "GET" }, workingDirectory, controller, [200], false);
+        if (!Array.isArray(catalog?.providers)) throw new Error("OpenCode returned an invalid model catalog.");
+        return catalog.providers.flatMap((provider) => {
+          if (!provider?.models || typeof provider.models !== "object" || Array.isArray(provider.models)) throw new Error("Invalid provider models.");
+          return Object.entries(provider.models).map(([id, model]) => ({
+            ...normalizeModel({ providerID: provider.id, modelID: model.id ?? id }),
+            name: typeof model.name === "string" ? model.name : id,
+          }));
+        });
+      } finally {
+        clearTimeout(timer);
+        active.delete(controller);
+      }
+    },
     async abortTurn(sessionId, reason = new Error("OpenCode turn aborted.")) {
       const turn = activeSessions.get(sessionId);
       if (!turn) return;
@@ -487,6 +532,7 @@ function latestAssistantMessage(messages, baseline) {
     if (!message?.info?.id || baseline.has(message.info.id) || message.info.role !== "assistant") continue;
     return {
       completed: typeof message.info.time?.completed === "number",
+      providerID: message.info.providerID,
       error: message.info.error,
       finish: message.info.finish,
       text: message.parts
