@@ -22,7 +22,7 @@ Use a distinct Slack test app and a separate `PIPA_HOME` (the parent of `.pipa`)
 
 1. Open the installation's model command (for example `/chopper model`), verify the loading window becomes a populated provider-grouped list, choose and save model A, wait for the private saved confirmation, then reopen to verify the selection. Closing the loading window must not reopen it when discovery finishes.
 2. Send an ordinary request and inspect the completed OpenCode assistant message's provider/model metadata. HTTP acceptance or asking the model which model it is does not prove selection.
-3. Save model B and reply in that same Slack thread. Verify completed metadata names B and that the session/history is retained.
+3. Save model B and reply in that same Slack thread. Verify completed metadata still names A and the session/history is retained. Start a new thread and verify it uses B. Restart the test profile and verify both threads retain their models.
 4. Cancel another picker and verify no setting changed. Restart only the test profile and reopen to verify persistence.
 5. Record selected IDs, completed metadata, and a short existing Slack conversation link separately from automated outcomes. Clean up only test-owned processes/state. Without the isolated app/profile, record the live-smoke gap rather than presenting adapter tests as live evidence.
 

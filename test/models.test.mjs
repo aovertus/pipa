@@ -54,7 +54,7 @@ for (const shutdown of [false, true]) test(`Save acknowledges before slow work; 
   }
   assert.equal(writes, shutdown ? 0 : 1);
   assert.equal(notices.length, shutdown ? 0 : 1);
-  if (!shutdown) assert.equal(notices[0][2], "Switched to Model A for all chats.");
+  if (!shutdown) assert.equal(notices[0][2], "New threads will use Model A.");
 });
 
 for (const cancel of [false, true]) test(`opens before slow discovery and ${cancel ? "does not refill a cancelled window" : "populates the window afterward"}`, async () => {
@@ -163,14 +163,15 @@ for (const [botName, command] of [["Chopper", "/chopper"], ["Chopper", "/pipa"],
     const saved = await adapter.handleViewSubmission({ user: { id: "U1" }, view: { ...view, id: `V${views.length}`, state: { values: { [actionId]: { [actionId]: { selected_option: choices[index] } } } } } });
     assert.deepEqual(await saved.json(), {}, "Save acknowledges by closing without waiting for persistence");
     for (let tries = 0; notices.length === noticeCount && tries < 100; tries++) await delay(10);
-    assert.equal(notices.at(-1)[2], `Switched to ${expected.name} for all chats.`);
+    assert.equal(notices.at(-1)[2], `New threads will use ${expected.name}.`);
     assert.deepEqual((await loadConfig(paths.config)).defaultModel, { providerID: expected.providerID, modelID: expected.modelID });
     const waiting = [];
     const message = adapter.parseMessage({ type: "message", channel: "C1", ts: `${index + 1}.0`, ...(index ? { thread_ts: "1.0" } : {}), text: index ? "follow up" : "<@UPIPA> begin", user: "U1" });
     chat.processMessage(adapter, message.threadId, message, { waitUntil: (p) => waiting.push(p) });
     await Promise.all(waiting);
     for (let tries = 0; posts.length <= index && tries < 100; tries++) await delay(10);
-    assert.deepEqual(calls[index].model, { providerID: expected.providerID, modelID: expected.modelID });
+    assert.deepEqual(calls[index].defaultModel, { providerID: expected.providerID, modelID: expected.modelID });
+    assert.equal(Object.hasOwn(calls[index], "model"), false, "the default must not force a model onto existing sessions");
   }
   assert.equal(calls[1].sessionId, "ses_same");
   assert.equal(posts.length, 2);
@@ -220,7 +221,7 @@ test("private picker preloads/saves/reopens/cancels without inference and rechec
   const saved = await handlers.submit(submission);
   assert.equal(saved.action, "close");
   await picker.drain();
-  assert.equal(messages.at(-1)[2], "Switched to Model A for all chats.");
+  assert.equal(messages.at(-1)[2], "New threads will use Model A.");
   assert.deepEqual((await loadConfig(paths.config)).defaultModel, { providerID: "openai", modelID: "model/a.b" });
   await handlers.slash(opening);
   assert.equal(modal.blocks[0].element.initial_option.value, options[0].value);

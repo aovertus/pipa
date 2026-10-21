@@ -81,7 +81,7 @@ export function createModelPicker({ chat, botName, commands, loadConfig, listMod
       failure = `Slack couldn't display the model list. Try ${command} model again in a moment.`;
       await event.adapter.webClient.views.update({ view_id: entry.viewId, view: {
         ...view, submit: { type: "plain_text", text: "Save" },
-        blocks: [{ type: "input", block_id: `pipa_model_${token}`, label: { type: "plain_text", text: `Default for ${botName} (this Pipa installation).` },
+        blocks: [{ type: "input", block_id: `pipa_model_${token}`, label: { type: "plain_text", text: `Default for new ${botName} threads` },
           element: { type: "static_select", action_id: `pipa_model_${token}`, option_groups: groups,
             placeholder: { type: "plain_text", text: "Browse models or type to filter" }, ...(initialModel ? { initial_option: modelOption(initialModel) } : {}) } }],
       } });
@@ -129,7 +129,7 @@ export function createModelPicker({ chat, botName, commands, loadConfig, listMod
           if (!model) throw new Error("unavailable model");
           failure = `I couldn't save your model choice. Reopen ${command} model to try again. Your saved model hasn't changed.`;
           await setting.save({ providerID: model.providerID, modelID: model.modelID }, (config) => authorize(entry, event, config));
-          message = `Switched to ${model.name || model.modelID} for all chats.`;
+          message = `New threads will use ${model.name || model.modelID}.`;
         } catch {
           message = failure;
         }

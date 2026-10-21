@@ -125,10 +125,11 @@ export function createOpenCodeExecutor(options = {}) {
     }
   }
 
-  async function runTurn({ prompt, sessionId, model, workingDirectory, contextEnvironment = {}, attachments = [], signal, onSession, onInteraction, onPermissionReplied, onPermissionsReconciled }) {
+  async function runTurn({ prompt, sessionId, model, defaultModel, workingDirectory, contextEnvironment = {}, attachments = [], signal, onSession, onInteraction, onPermissionReplied, onPermissionsReconciled }) {
     if (!prompt?.trim()) throw new Error("A prompt is required.");
     if (stopReason) throw stopReason;
-    const selectedModel = normalizeModel(model);
+    let selectedModel = normalizeModel(model);
+    const newThreadModel = normalizeModel(defaultModel);
     const temporaryDirectory = attachments.length ? await mkdtemp(path.join(os.tmpdir(), "pipa-files-")) : null;
     const slackTurn = contextEnvironment.PIPA_MESSAGE_CHANNEL === "slack";
     const controller = new AbortController();
@@ -164,6 +165,13 @@ export function createOpenCodeExecutor(options = {}) {
           messages = [];
         }
 
+        if (!selectedModel) {
+          // OpenCode history persists the thread's model, including interrupted user turns.
+          const last = messages.at(-1)?.info;
+          const threadModel = last?.role === "user" ? last.model
+            : last?.providerID && last?.modelID ? { providerID: last.providerID, modelID: last.modelID } : null;
+          selectedModel = normalizeModel(threadModel) ?? newThreadModel;
+        }
         activeSessions.set(selectedSessionId, { controller, workingDirectory });
         await onSession?.(selectedSessionId);
         if (controller.signal.aborted) throw controller.signal.reason;
@@ -221,8 +229,8 @@ export function createOpenCodeExecutor(options = {}) {
             if (statusCode === 401 || error.name === "ProviderAuthError") {
               const expiredKey = statusCode === 401 && typeof error.data?.message === "string" && /\bAPI key (?:has )?expired\b/iu.test(error.data.message);
               throw new Error(expiredKey
-                ? `OpenCode ${provider} API key has expired. Replace that provider's API key in OpenCode, or choose another provider with your installation's model command.`
-                : `OpenCode ${provider} authentication failed${http}. Reconnect that provider in OpenCode, or choose another provider with your installation's model command.`);
+                ? `OpenCode ${provider} API key has expired. Replace that provider's API key in OpenCode, or choose another provider with your installation's model command, then start a new thread.`
+                : `OpenCode ${provider} authentication failed${http}. Reconnect that provider in OpenCode, or choose another provider with your installation's model command, then start a new thread.`);
             }
             throw new Error(`OpenCode ${provider} ${http ? `failed${http}` : "failed to complete the turn"}.`);
           }

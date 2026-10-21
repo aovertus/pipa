@@ -220,6 +220,43 @@ test("uses native sessions, prompt_async, status, messages, context, and file pa
   await assert.rejects(access(temporaryFile));
 });
 
+test("new threads use the default while existing threads retain their model across executor restarts", async () => {
+  const a = { providerID: "openai", modelID: "a" };
+  const b = { providerID: "fireworks-ai", modelID: "b" };
+  const history = new Map();
+  const prompts = [];
+  const fetch = async (url, init = {}) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/session/status") return jsonResponse({});
+    if (pathname === "/session") {
+      const id = `ses_${history.size}`;
+      history.set(id, []);
+      return jsonResponse({ id });
+    }
+    const [, , id, action] = pathname.split("/");
+    if (action === "message") return history.has(id) ? jsonResponse(history.get(id)) : jsonResponse({ error: "not found" }, 404);
+    if (action === "prompt_async") {
+      const body = JSON.parse(init.body);
+      prompts.push(body.model);
+      history.set(id, [{ info: { id: `msg_${prompts.length}`, role: "assistant", ...body.model, time: { completed: 1 } }, parts: [{ type: "text", text: "done" }] }]);
+      return new Response(null, { status: 204 });
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+  const run = (input) => createOpenCodeExecutor({ baseUrl: "http://localhost:5555", fetch, pollIntervalMs: 1 })
+    .runTurn({ prompt: "hello", workingDirectory: "/work", ...input });
+  const first = await run({ defaultModel: a });
+  await run({ sessionId: first.sessionId, defaultModel: b });
+  await run({ defaultModel: b });
+  // An interrupted turn may leave a user message as the latest history entry.
+  history.set(first.sessionId, [{ info: { id: "user", role: "user", model: a }, parts: [] }]);
+  await run({ sessionId: first.sessionId, defaultModel: b });
+  await run({ sessionId: first.sessionId });
+  await run({ sessionId: "ses_missing", defaultModel: b });
+  await run({});
+  assert.deepEqual(prompts, [a, a, b, a, a, b, undefined]);
+});
+
 test("rejects an all-whitespace prompt before creating a session", async () => {
   let requested = false;
   const executor = createOpenCodeExecutor({

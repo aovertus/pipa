@@ -78,7 +78,7 @@ export async function startPipa(options = {}) {
   }
   const runner = createConversationRunner({ sessionStore, abortTurn: executor.abortTurn, runTurn: async (input) => {
     const currentConfig = await loadCurrentConfig();
-    return executor.runTurn({ ...input, ...(currentConfig.defaultModel ? { model: currentConfig.defaultModel } : {}) });
+    return executor.runTurn({ ...input, ...(currentConfig.defaultModel ? { defaultModel: currentConfig.defaultModel } : {}) });
   } });
   let accepting = true;
   const interactions = createPendingInteractions(config.allowedSlackUserIds);

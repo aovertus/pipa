@@ -1320,7 +1320,8 @@ test("routine scheduler uses an exact destination and binds replies to its fresh
   await waitFor(() => calls.length === 2);
   assert.equal(calls[1].prompt, "How many items?");
   assert.equal(calls[1].sessionId, "ses_routine");
-  assert.deepEqual(calls[1].model, modelB);
+  assert.deepEqual(calls[1].defaultModel, modelB);
+  assert.equal(Object.hasOwn(calls[1], "model"), false, "routine replies retain their session model rather than forcing the new default");
   assert.deepEqual(posts, [
     { id: "slack:C123:", payload: { markdown: "finished" } },
     { id: conversationKey, payload: { markdown: "continued" } },
