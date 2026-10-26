@@ -1,17 +1,65 @@
-# Pipa
+<p align="center">
+  <a href="https://www.usepipa.com/opencode-slack">
+    <img src="docs/assets/banner.png" alt="Pipa: run OpenCode from Slack" width="100%">
+  </a>
+</p>
 
-[![CI](https://github.com/lunchpaillola/pipa/actions/workflows/ci.yml/badge.svg)](https://github.com/lunchpaillola/pipa/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+<p align="center">
+  <a href="https://github.com/lunchpaillola/pipa/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/lunchpaillola/pipa/ci.yml?branch=main&style=flat-square&label=CI"></a>
+  <a href="https://www.npmjs.com/package/@usepipa/pipa"><img alt="npm" src="https://img.shields.io/npm/v/@usepipa/pipa?style=flat-square&color=2437F5&label=npm"></a>
+</p>
 
-Pipa runs Slack through one persistent private OpenCode server with no hosted relay, database, public endpoint, or sandbox.
+<p align="center">
+  <strong>Pipa turns a Slack thread into a durable OpenCode session on one private server, local by default.</strong><br>
+  No relay, no database, no public endpoint.
+</p>
 
-[View Pipa on GitHub](https://github.com/lunchpaillola/pipa). If it is useful, star the repo so more people can find it.
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=rlTMdkPWPcA"><strong>Watch the 3-minute setup</strong></a>
+  ·
+  <a href="https://www.usepipa.com/opencode-slack">How it works</a>
+  ·
+  <a href="CONTRIBUTING.md">Contributing</a>
+  ·
+  <a href="https://github.com/lunchpaillola/pipa/issues">Issues</a>
+</p>
 
-**Pipa is in early preview. Features may break unintentionally, and CLI commands, configuration, and Slack behavior may continue to change.**
+> **Early preview.** Features may break unintentionally, and CLI commands, configuration, and Slack behavior may continue to change.
+
+## Why Pipa
+
+| What it does | What that means |
+| --- | --- |
+| **One server** | In local mode, Pipa starts one private OpenCode server on `127.0.0.1` and reuses it for every Slack turn. Attached servers follow their own network controls. |
+| **Thread sessions** | A mention starts a session; replies in that thread continue it. Different threads run independently, and a newer message interrupts only its own thread. |
+| **Routines** | Schedule timezone-aware work that runs through the same agent and delivers to an exact channel or thread. |
+| **Generated files** | In local mode, long work returns as a concise summary with generated files from a private per-turn directory. Attached non-loopback servers return inline text. |
+| **Access control** | Restrict by Slack channel, human user, and bot. Allowlists are rechecked on every turn, interaction, and delivery. |
+| **Restart** | `pipa restart` hands off to a detached worker and reports a durable status. |
+
+If Pipa is useful, [star the repo](https://github.com/lunchpaillola/pipa).
+
+## Quickstart
+
+**Runs on** macOS, Linux, and Windows. **Requires** Node.js 22 or newer, [OpenCode](https://opencode.ai) installed and authenticated, and a Slack workspace where you can create an app.
+
+```sh
+npm install --global @usepipa/pipa
+pipa init
+pipa start
+```
+
+`pipa init` creates the Slack app manifest, opens the install flow, and saves the profile under `~/.pipa`. Invite Pipa to a channel and mention it. The [3-minute setup video](https://www.youtube.com/watch?v=rlTMdkPWPcA) shows the flow, and the [OpenCode Slack integration guide](https://www.usepipa.com/opencode-slack) is the current written path.
+
+## Security model
+
+In local mode, Pipa runs on your machine, not behind a relay. The local OpenCode server binds to `127.0.0.1` on an operating-system-assigned port; attached servers follow their own network controls. Slack access is limited by channel, user, and bot allowlists, rechecked on every turn. Tokens stay in the local profile with private file permissions, and OpenCode manages provider credentials.
+
+Read [SECURITY.md](SECURITY.md) for the full model and reporting path.
 
 ## Pipa Managed
 
-Want someone to configure, run, and manage agent workflows for your company? Check out [Pipa Managed](https://usepipa.com/managed?utm_source=github&utm_medium=repo_readme&utm_campaign=signup&utm_content=readme_managed). We set up a Slack-native operations agent around how your team works, then keep its workflows running and improving over time.
+Want Lunch Pail Labs to configure, run, and manage agent workflows for your company? Check out [Pipa Managed](https://usepipa.com/managed?utm_source=github&utm_medium=readme). We set up a Slack-native operations agent for your team, then keep the workflows running.
 
 ## Local Socket Mode
 
@@ -47,9 +95,9 @@ pipa init
 pipa start
 ```
 
-Keep `pipa start` running, invite Pipa to a trusted public or private Slack channel, and mention it there. Pipa starts one OpenCode server bound to `127.0.0.1` on an operating-system-assigned port and reuses it for every Slack turn. Port `0` asks the operating system for an available port; no port configuration is required. Pipa replies in a thread, and follow-up messages in that thread reuse the same OpenCode session without another mention. A newer follow-up interrupts an active turn in the same thread, while other threads continue independently. While a turn is active, Pipa shows a typing status in its Slack thread.
+Keep `pipa start` running, invite Pipa to a trusted public or private Slack channel, and mention it there. In owned local mode, Pipa starts one OpenCode server bound to `127.0.0.1` on an operating-system-assigned port and reuses it for every Slack turn. Port `0` asks the operating system for an available port; no port configuration is required. Pipa replies in a thread, and follow-up messages in that thread reuse the same OpenCode session without another mention. A newer follow-up interrupts an active turn in the same thread, while other threads continue independently. While a turn is active, Pipa shows a typing status in its Slack thread.
 
-Pipa keeps naturally short answers inline. For deeper work, OpenCode can return a concise summary with suitable generated files, such as documents, spreadsheets, PDFs, or images. Files are read only from a private session directory under `.pipa/artifacts` in the configured working directory. The directory is cleared before each turn, files are validated and limited to 10 files and 100 MB per file or response, and the directory is deleted locally after delivery. If file delivery fails, Pipa retries the declaration-free summary without the files. Attached OpenCode servers on non-loopback hosts use inline text fallback instead of local artifact delivery.
+Pipa keeps naturally short answers inline. For deeper work, OpenCode can return a concise summary with suitable generated files, such as documents, spreadsheets, PDFs, or images. Files are read only from a private session directory under `.pipa/artifacts` in the configured working directory. The directory is cleared before each turn, files are validated and limited to 10 files and 100 MB total, and the directory is deleted locally after delivery. If file delivery fails, Pipa retries the declaration-free summary without the files. Attached OpenCode servers on non-loopback hosts use inline text fallback instead of local artifact delivery.
 
 Incoming messages can include up to Slack's 10-file limit, with a maximum size of 100 MB per file. Attachments require a text prompt and are copied to a temporary directory only for the duration of the turn.
 
